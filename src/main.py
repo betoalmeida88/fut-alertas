@@ -8,7 +8,7 @@ import requests
 BASE_URL = "https://v3.football.api-sports.io"
 TZ = ZoneInfo("America/Sao_Paulo")
 
-# ✅ Todas as ligas/campeonatos serão aceitos.
+# ✅ Aceita TODAS as ligas/campeonatos.
 # Se quiser bloquear só amistosos/treinos, mantenha essas palavras.
 BLOCK_KEYWORDS = [
     "Friendly", "Friendlies", "Amistoso", "Amistosos", "Test", "Treino"
@@ -17,7 +17,7 @@ BLOCK_KEYWORDS = [
 TARGET_LEAGUES = None  # None = aceita TODAS as ligas
 
 # Forma recente (mínimo desejado)
-LAST_N = 3
+LAST_N = 10
 
 # Margem da casa (odd “abaixo” da justa)
 BOOK_MARGIN = 0.07  # 7% (ajuste depois se quiser)
@@ -113,7 +113,7 @@ def match_probs(lh: float, la: float, max_g: int = 10) -> dict:
 
 def odds_with_margin(p: float, margin: float = BOOK_MARGIN) -> float:
     # odd justa = 1/p
-    # odd "casa" = 1 / (p * (1 + margem))  -> menor que a justa
+    # odd "casa" = 1 / (p * (1 + margem)) -> menor que a justa
     p = max(0.0001, min(0.9999, float(p)))
     p_adj = min(0.9999, p * (1.0 + float(margin)))
     return 1.0 / p_adj
@@ -224,14 +224,17 @@ def main() -> None:
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
     tg_chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
+    # ✅ Queremos SEMPRE olhar jogos do DIA SEGUINTE em Brasília.
     now_sp = dt.datetime.now(TZ)
-    sp_date = now_sp.date().isoformat()
+    target_date = (now_sp.date() + dt.timedelta(days=1)).isoformat()
 
+    # Buscamos 3 datas UTC para garantir cobertura por causa do fuso.
     utc0 = dt.datetime.utcnow().date()
     utc1 = utc0 + dt.timedelta(days=1)
+    utc2 = utc0 + dt.timedelta(days=2)
 
     games_map = {}
-    for d in [utc0.isoformat(), utc1.isoformat()]:
+    for d in [utc0.isoformat(), utc1.isoformat(), utc2.isoformat()]:
         fx = api_get("/fixtures", api_key, params={"date": d, "timezone": "America/Sao_Paulo"})
         for g in fx.get("response", []) or []:
             fid = int(g["fixture"]["id"])
@@ -242,7 +245,7 @@ def main() -> None:
     games = []
     for g in games_all:
         kickoff = dt.datetime.fromisoformat(g["fixture"]["date"])
-        if kickoff.date().isoformat() != sp_date:
+        if kickoff.date().isoformat() != target_date:
             continue
 
         league_country = g["league"].get("country", "") or ""
@@ -252,7 +255,6 @@ def main() -> None:
         games.append(g)
 
     # Limite para não estourar requests no plano free.
-    # Se quiser mais cobertura, aumente para 30-40, mas cuidado com 100 req/dia.
     games = games[:25]
 
     candidates = []
@@ -321,8 +323,6 @@ def main() -> None:
                 })
 
 
-
-    # Ordena por maior prob (mais “seguro”) e perto do range 1.30~1.45
     candidates.sort(key=lambda x: (-x["p"], abs(x["odd_book"] - 1.40)))
 
     used_fixture_ids: set[int] = set()
@@ -336,15 +336,15 @@ def main() -> None:
     ]
 
     out = []
-    out.append(f"📌 Fut Alertas — {sp_date} (SP)")
+    out.append(f"📌 Fut Alertas — jogos de {target_date} (SP)")
     out.append(f"Amostra: últimos {LAST_N} jogos (casa=home, fora=away).")
-    out.append(f"Odd estimada já com margem da casa (~{int(BOOK_MARGIN*100)}%).")
+    out.append(f"Odd estimada já com margem (~{int(BOOK_MARGIN*100)}%).")
     out.append("Regras: pernas não se repetem + cada perna ≤ 1.50.")
     out.append("")
 
     if not candidates:
-        out.append("⚠️ Hoje não encontrei pernas suficientes (com 10 jogos mínimos por time e odd ≤ 1.50).")
-        out.append("Dica: aumente 'games = games[:25]' para 35 OU reduza LAST_N para 8 (se quiser mais cobertura).")
+        out.append("⚠️ Não encontrei pernas suficientes (com 10 jogos mínimos por time e odd ≤ 1.50).")
+        out.append("Dica: aumente 'games = games[:25]' para 35 OU reduza LAST_N para 8.")
         send_telegram(tg_token, tg_chat_id, "\n".join(out))
         return
 
