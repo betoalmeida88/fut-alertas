@@ -8,29 +8,25 @@ import requests
 BASE_URL = "https://v3.football.api-sports.io"
 TZ = ZoneInfo("America/Sao_Paulo")
 
-# Para evitar ligas “estranhas” (U20, Women, etc.)
+# ✅ Todas as ligas/campeonatos serão aceitos.
+# Se quiser bloquear só amistosos/treinos, mantenha essas palavras.
 BLOCK_KEYWORDS = [
-    "Women", "Feminil", "Feminino", "U20", "U19", "U17", "Youth", "Reserve", "Reserves"
+    "Friendly", "Friendlies", "Amistoso", "Amistosos", "Test", "Treino"
 ]
 
-# Principais competições (você pode ajustar depois)
-TARGET_LEAGUES = {
-    ("Brazil", "Serie A"),
-    ("Brazil", "Serie B"),
-    ("England", "Premier League"),
-    ("Spain", "La Liga"),
-    ("Germany", "Bundesliga"),
-    ("Italy", "Serie A"),
-    ("France", "Ligue 1"),
-    ("Portugal", "Primeira Liga"),
-    ("Netherlands", "Eredivisie"),
-    ("World", "UEFA Champions League"),
-    ("World", "UEFA Europa League"),
-    ("World", "UEFA Europa Conference League"),
-    ("World", "Copa Libertadores"),
-    ("World", "Copa Sudamericana"),
-    ("Brazil", "Copa do Brasil"),
-}
+TARGET_LEAGUES = None  # None = aceita TODAS as ligas
+
+# Forma recente (mínimo desejado)
+LAST_N = 10
+
+# Margem da casa (odd “abaixo” da justa)
+BOOK_MARGIN = 0.07  # 7% (ajuste depois se quiser)
+
+# Odds por perna (como você pediu)
+MIN_ODD = 1.18
+MAX_ODD = 1.50
+
+FINISHED_STATUSES = {"FT", "AET", "PEN"}  # finalizado, prorrogação, pênaltis
 
 
 def api_get(path: str, api_key: str, params: dict | None = None) -> dict:
@@ -56,6 +52,14 @@ def safe_float(x, default=0.0) -> float:
         return float(default)
 
 
+def is_target_game(league_country: str, league_name: str) -> bool:
+    if any(k.lower() in league_name.lower() for k in BLOCK_KEYWORDS):
+        return False
+    if TARGET_LEAGUES is None:
+        return True
+    return (league_country, league_name) in TARGET_LEAGUES
+
+
 def poisson_probs(lam: float, max_k: int = 10) -> list[float]:
     lam = max(0.2, float(lam))
     p0 = math.exp(-lam)
@@ -73,6 +77,8 @@ def match_probs(lh: float, la: float, max_g: int = 10) -> dict:
     p_home_win = 0.0
     p_draw = 0.0
     p_away_win = 0.0
+
+    p_total_leq_1 = 0.0
     p_total_leq_3 = 0.0
     p_total_leq_4 = 0.0
 
@@ -86,41 +92,89 @@ def match_probs(lh: float, la: float, max_g: int = 10) -> dict:
             else:
                 p_away_win += p
 
+            if i + j <= 1:
+                p_total_leq_1 += p
             if i + j <= 3:
                 p_total_leq_3 += p
             if i + j <= 4:
                 p_total_leq_4 += p
 
-    p_over_1_5 = 1.0 - p_total_leq_3  # total >= 4? (errado) -> vamos ajustar abaixo
-
-    # Correção: Over 1.5 = total >= 2
-    # P(total <=1) = somar i+j <= 1
-    p_total_leq_1 = 0.0
-    for i in range(max_g + 1):
-        for j in range(max_g + 1):
-            if i + j <= 1:
-                p_total_leq_1 += ph[i] * pa[j]
-    p_over_1_5 = 1.0 - p_total_leq_1
-
     return {
         "home_win": p_home_win,
         "draw": p_draw,
         "away_win": p_away_win,
-        "under_3_5": p_total_leq_3,   # total <= 3
-        "under_4_5": p_total_leq_4,   # total <= 4
-        "over_1_5": p_over_1_5,       # total >= 2
+        "over_1_5": 1.0 - p_total_leq_1,   # total >= 2
+        "under_3_5": p_total_leq_3,        # total <= 3
+        "under_4_5": p_total_leq_4,        # total <= 4
         "home_score_1+": 1.0 - ph[0],
         "away_score_1+": 1.0 - pa[0],
     }
 
 
-def is_target_game(league_country: str, league_name: str) -> bool:
-    if any(k.lower() in league_name.lower() for k in BLOCK_KEYWORDS):
-        return False
-    return (league_country, league_name) in TARGET_LEAGUES
+def odds_with_margin(p: float, margin: float = BOOK_MARGIN) -> float:
+    # odd justa = 1/p
+    # odd "casa" = 1 / (p * (1 + margem))  -> menor que a justa
+    p = max(0.0001, min(0.9999, float(p)))
+    p_adj = min(0.9999, p * (1.0 + float(margin)))
+    return 1.0 / p_adj
 
 
-def build_combo(target: float, candidates: list[dict], used_fixture_ids: set[int], used_leg_ids: set[str], base_n: int):
+def get_recent_avgs(api_key: str, team_id: int, venue: str, n: int = LAST_N) -> tuple[float, float, int]:
+    """
+    Retorna (avg_for, avg_against, sample_count) usando os últimos n jogos do time no venue (home/away).
+    """
+    data = api_get(
+        "/fixtures",
+        api_key,
+        params={
+            "team": team_id,
+            "last": max(25, n),   # pega mais pra garantir que tenha FT
+            "venue": venue,       # "home" ou "away"
+            "timezone": "America/Sao_Paulo",
+        },
+    )
+    fx = data.get("response", []) or []
+
+    goals_for = []
+    goals_against = []
+
+    for f in fx:
+        st = (f.get("fixture", {}).get("status", {}) or {}).get("short", "")
+        if st not in FINISHED_STATUSES:
+            continue
+
+        home_id = int(f["teams"]["home"]["id"])
+        away_id = int(f["teams"]["away"]["id"])
+        gh = f.get("goals", {}).get("home", None)
+        ga = f.get("goals", {}).get("away", None)
+        if gh is None or ga is None:
+            continue
+
+        if team_id == home_id:
+            goals_for.append(int(gh))
+            goals_against.append(int(ga))
+        elif team_id == away_id:
+            goals_for.append(int(ga))
+            goals_against.append(int(gh))
+
+        if len(goals_for) >= n:
+            break
+
+    if not goals_for:
+        return 0.0, 0.0, 0
+
+    avg_for = sum(goals_for) / len(goals_for)
+    avg_against = sum(goals_against) / len(goals_against)
+    return avg_for, avg_against, len(goals_for)
+
+
+def build_combo(
+    target: float,
+    candidates: list[dict],
+    used_fixture_ids: set[int],
+    used_leg_ids: set[str],
+    base_n: int,
+):
     legs = []
     product = 1.0
 
@@ -132,18 +186,17 @@ def build_combo(target: float, candidates: list[dict], used_fixture_ids: set[int
                 continue
             if c["leg_id"] in used_leg_ids:
                 continue
-            odd = c["odd"]
+            odd = c["odd_book"]
             if odd > 1.5:
                 continue
-            # escolhe o que mais se aproxima da odd desejada, e em empate pega maior prob
             key = (abs(odd - desired_odd), -c["p"])
             if best is None or key < best_key:
                 best = c
                 best_key = key
         return best
 
-    # Primeiro, pega base_n pernas
     desired_per_leg = target ** (1.0 / base_n)
+
     for _ in range(base_n):
         c = pick_best(desired_per_leg)
         if not c:
@@ -151,18 +204,17 @@ def build_combo(target: float, candidates: list[dict], used_fixture_ids: set[int
         legs.append(c)
         used_fixture_ids.add(c["fixture_id"])
         used_leg_ids.add(c["leg_id"])
-        product *= c["odd"]
+        product *= c["odd_book"]
 
-    # Se ficou abaixo do alvo, tenta completar com mais pernas (até 6)
     while product < target * 0.95 and len(legs) < 6:
-        remaining = min(1.5, target / product)
+        remaining = min(1.5, target / max(1e-9, product))
         c = pick_best(remaining)
         if not c:
             break
         legs.append(c)
         used_fixture_ids.add(c["fixture_id"])
         used_leg_ids.add(c["leg_id"])
-        product *= c["odd"]
+        product *= c["odd_book"]
 
     return legs, product
 
@@ -175,84 +227,65 @@ def main() -> None:
     now_sp = dt.datetime.now(TZ)
     sp_date = now_sp.date().isoformat()
 
-    # Para garantir “jogos do dia SP”, buscamos 2 datas UTC e filtramos pelo dia SP
     utc0 = dt.datetime.utcnow().date()
     utc1 = utc0 + dt.timedelta(days=1)
 
-    games_all = []
+    games_map = {}
     for d in [utc0.isoformat(), utc1.isoformat()]:
         fx = api_get("/fixtures", api_key, params={"date": d, "timezone": "America/Sao_Paulo"})
-        games_all.extend(fx.get("response", []))
+        for g in fx.get("response", []) or []:
+            fid = int(g["fixture"]["id"])
+            games_map[fid] = g
 
-    # Filtra jogos do dia (SP) e ligas alvo
+    games_all = list(games_map.values())
+
     games = []
     for g in games_all:
         kickoff = dt.datetime.fromisoformat(g["fixture"]["date"])
         if kickoff.date().isoformat() != sp_date:
             continue
 
-        league_country = g["league"]["country"]
-        league_name = g["league"]["name"]
+        league_country = g["league"].get("country", "") or ""
+        league_name = g["league"].get("name", "") or ""
+        if not is_target_game(league_country, league_name):
+            continue
+        games.append(g)
 
-        if is_target_game(league_country, league_name):
-            games.append(g)
-
-    # Se ficou muito curto, relaxa: pega qualquer liga (menos U20/Women etc.)
-    if len(games) < 13:
-        games = []
-        for g in games_all:
-            kickoff = dt.datetime.fromisoformat(g["fixture"]["date"])
-            if kickoff.date().isoformat() != sp_date:
-                continue
-            league_name = g["league"]["name"]
-            if any(k.lower() in league_name.lower() for k in BLOCK_KEYWORDS):
-                continue
-            games.append(g)
-
-    # Limite para não estourar o plano free
-    games = games[:18]
-
-    # Cache de stats por time/league/season
-    stats_cache: dict[tuple[int, int, int], dict] = {}
-
-    def team_stats(team_id: int, league_id: int, season: int) -> dict:
-        key = (team_id, league_id, season)
-        if key in stats_cache:
-            return stats_cache[key]
-        data = api_get("/teams/statistics", api_key, params={"team": team_id, "league": league_id, "season": season})
-        resp = data.get("response") or {}
-        stats_cache[key] = resp
-        return resp
+    # Limite para não estourar requests no plano free.
+    # Se quiser mais cobertura, aumente para 30-40, mas cuidado com 100 req/dia.
+    games = games[:25]
 
     candidates = []
-    # Preferimos odds teóricas entre 1.22 e 1.50 para conseguir montar combos 2/3/4/5
-    MIN_ODD = 1.22
-    MAX_ODD = 1.50
+
+    # Cache: (team_id, venue) -> (avg_for, avg_against, sample)
+    recent_cache: dict[tuple[int, str], tuple[float, float, int]] = {}
+
+    def recent(team_id: int, venue: str) -> tuple[float, float, int]:
+        key = (team_id, venue)
+        if key in recent_cache:
+            return recent_cache[key]
+        val = get_recent_avgs(api_key, team_id, venue, LAST_N)
+        recent_cache[key] = val
+        return val
 
     for g in games:
         fixture_id = int(g["fixture"]["id"])
         league = g["league"]["name"]
-        season = int(g["league"]["season"])
-        league_id = int(g["league"]["id"])
-
         home_id = int(g["teams"]["home"]["id"])
         away_id = int(g["teams"]["away"]["id"])
         home = g["teams"]["home"]["name"]
         away = g["teams"]["away"]["name"]
         kickoff = dt.datetime.fromisoformat(g["fixture"]["date"]).strftime("%H:%M")
 
-        hs = team_stats(home_id, league_id, season)
-        aws = team_stats(away_id, league_id, season)
+        home_for, home_against, home_n = recent(home_id, "home")
+        away_for, away_against, away_n = recent(away_id, "away")
 
-        # médias casa/fora
-        home_for_home = safe_float(hs.get("goals", {}).get("for", {}).get("average", {}).get("home"))
-        home_against_home = safe_float(hs.get("goals", {}).get("against", {}).get("average", {}).get("home"))
-        away_for_away = safe_float(aws.get("goals", {}).get("for", {}).get("average", {}).get("away"))
-        away_against_away = safe_float(aws.get("goals", {}).get("against", {}).get("average", {}).get("away"))
+        # Precisa ter pelo menos 10 jogos (como você pediu)
+        if home_n < LAST_N or away_n < LAST_N:
+            continue
 
-        # estimativa simples de gols esperados
-        lam_home = max(0.2, (home_for_home + away_against_away) / 2.0)
-        lam_away = max(0.2, (away_for_away + home_against_home) / 2.0)
+        lam_home = max(0.2, (home_for + away_against) / 2.0)
+        lam_away = max(0.2, (away_for + home_against) / 2.0)
 
         probs = match_probs(lam_home, lam_away)
 
@@ -268,8 +301,10 @@ def main() -> None:
 
         for code, label, p in markets:
             p = max(0.0001, float(p))
-            odd = 1.0 / p
-            if MIN_ODD <= odd <= MAX_ODD:
+            odd_fair = 1.0 / p
+            odd_book = odds_with_margin(p, BOOK_MARGIN)
+
+            if MIN_ODD <= odd_book <= MAX_ODD:
                 candidates.append({
                     "fixture_id": fixture_id,
                     "leg_id": f"{fixture_id}:{code}",
@@ -279,13 +314,16 @@ def main() -> None:
                     "kickoff": kickoff,
                     "label": label,
                     "p": p,
-                    "odd": odd,
-                    "lam_home": lam_home,
-                    "lam_away": lam_away,
+                    "odd_fair": odd_fair,
+                    "odd_book": odd_book,
+                    "sample_home": home_n,
+                    "sample_away": away_n,
                 })
 
-    # Ordena candidatos por maior prob (mais “seguro”)
-    candidates.sort(key=lambda x: (-x["p"], abs(x["odd"] - 1.40)))
+
+
+    # Ordena por maior prob (mais “seguro”) e perto do range 1.30~1.45
+    candidates.sort(key=lambda x: (-x["p"], abs(x["odd_book"] - 1.40)))
 
     used_fixture_ids: set[int] = set()
     used_leg_ids: set[str] = set()
@@ -294,17 +332,19 @@ def main() -> None:
         (2.0, 2),
         (3.0, 3),
         (4.0, 4),
-        (5.0, 4),  # 4 pernas já pode chegar perto de 5 com odds <= 1.5
+        (5.0, 4),
     ]
 
     out = []
-    out.append(f"📌 Fut Alertas — {sp_date} (horário SP)")
-    out.append("Odds abaixo são *teóricas* (modelo). Confira odds reais na casa.")
+    out.append(f"📌 Fut Alertas — {sp_date} (SP)")
+    out.append(f"Amostra: últimos {LAST_N} jogos (casa=home, fora=away).")
+    out.append(f"Odd estimada já com margem da casa (~{int(BOOK_MARGIN*100)}%).")
     out.append("Regras: pernas não se repetem + cada perna ≤ 1.50.")
     out.append("")
 
     if not candidates:
-        out.append("⚠️ Hoje não encontrei pernas suficientes (odd teórica entre 1.22 e 1.50).")
+        out.append("⚠️ Hoje não encontrei pernas suficientes (com 10 jogos mínimos por time e odd ≤ 1.50).")
+        out.append("Dica: aumente 'games = games[:25]' para 35 OU reduza LAST_N para 8 (se quiser mais cobertura).")
         send_telegram(tg_token, tg_chat_id, "\n".join(out))
         return
 
@@ -315,11 +355,11 @@ def main() -> None:
             out.append("")
             continue
 
-        out.append(f"✅ Combo alvo ~{target:.0f} | odd teórica ≈ {prod:.2f} | pernas: {len(legs)}")
+        out.append(f"✅ Combo alvo ~{target:.0f} | odd estimada ≈ {prod:.2f} | pernas: {len(legs)}")
         for i, leg in enumerate(legs, 1):
             out.append(
                 f"  {i}) {leg['home']} x {leg['away']} ({leg['league']} {leg['kickoff']})"
-                f" — {leg['label']} | p={leg['p']:.0%} | odd≈{leg['odd']:.2f}"
+                f" — {leg['label']} | p={leg['p']:.0%} | odd≈{leg['odd_book']:.2f}"
             )
         out.append("")
 
