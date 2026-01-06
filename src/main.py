@@ -17,7 +17,7 @@ BLOCK_KEYWORDS = [
 TARGET_LEAGUES = None  # None = aceita TODAS as ligas
 
 # Forma recente (mínimo desejado)
-LAST_N = 10
+LAST_N = 3
 
 # Margem da casa (odd “abaixo” da justa)
 BOOK_MARGIN = 0.07  # 7% (ajuste depois se quiser)
@@ -255,7 +255,7 @@ def main() -> None:
         games.append(g)
 
     # Limite para não estourar requests no plano free.
-    games = games[:25]
+    games = games[:35]
 
     candidates = []
 
