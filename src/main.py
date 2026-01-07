@@ -18,6 +18,7 @@ BASE_URL = "https://v3.football.api-sports.io"
 TZ = ZoneInfo("America/Sao_Paulo")
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
+# Range de odds por perna (interpretei "1,5 e 1,15" como 1.15–1.50)
 MIN_ODD = float(os.getenv("MIN_ODD", "1.15"))
 MAX_ODD = float(os.getenv("MAX_ODD", "1.50"))
 BOOK_MARGIN = float(os.getenv("BOOK_MARGIN", "0.07"))
@@ -40,6 +41,16 @@ DEBUG_MAX_MATCH_DETAIL = int(os.getenv("DEBUG_MAX_MATCH_DETAIL", "140"))
 DEBUG_MAX_REJECT_SAMPLES = int(os.getenv("DEBUG_MAX_REJECT_SAMPLES", "80"))
 DEBUG_MAX_API_ERROR_SAMPLES = int(os.getenv("DEBUG_MAX_API_ERROR_SAMPLES", "60"))
 DEBUG_MAX_EMPTY_FIXTURES_SAMPLES = int(os.getenv("DEBUG_MAX_EMPTY_FIXTURES_SAMPLES", "60"))
+
+# Novo: modo "5 combos alvo ~3"
+N_TARGET_COMBOS = int(os.getenv("N_TARGET_COMBOS", "5"))            # <<< AJUSTE (era 10)
+TARGET_COMBO_ODD = float(os.getenv("TARGET_COMBO_ODD", "3.0"))
+MIN_LEGS_TARGET = int(os.getenv("MIN_LEGS_TARGET", "2"))
+MAX_LEGS_TARGET = int(os.getenv("MAX_LEGS_TARGET", "5"))
+SEED_POOL_TARGET = int(os.getenv("SEED_POOL_TARGET", "80"))
+
+# Telegram: split para não estourar limite
+TELEGRAM_MAX_LEN = int(os.getenv("TELEGRAM_MAX_LEN", "3800"))
 
 BLOCK_LEAGUE_WORDS = [
     "women", "woman", "femin", "feminino", "femenino", "femenil",
@@ -174,10 +185,35 @@ def api_request(method: str, path: str, api_key: str, params: dict | None = None
 
     raise RuntimeError(f"Falha ao chamar {path} após retries.")
 
+def _split_text_for_telegram(text: str, max_len: int) -> List[str]:
+    text = text or ""
+    if len(text) <= max_len:
+        return [text]
+
+    parts: List[str] = []
+    buf: List[str] = []
+    cur = 0
+    for line in text.splitlines(True):  # mantém \n
+        if cur + len(line) > max_len and buf:
+            parts.append("".join(buf).rstrip())
+            buf = []
+            cur = 0
+        buf.append(line)
+        cur += len(line)
+
+    if buf:
+        parts.append("".join(buf).rstrip())
+
+    return [p for p in parts if p.strip()]
+
 def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
-    r.raise_for_status()
+    chunks = _split_text_for_telegram(text, TELEGRAM_MAX_LEN)
+    for i, chunk in enumerate(chunks):
+        r = requests.post(url, data={"chat_id": chat_id, "text": chunk}, timeout=30)
+        r.raise_for_status()
+        if i < len(chunks) - 1:
+            time.sleep(0.25)
 
 def send_telegram_document(token: str, chat_id: str, filename: str, content: str, caption: str = "") -> None:
     url = f"https://api.telegram.org/bot{token}/sendDocument"
@@ -273,7 +309,6 @@ def debug_check_api_payload(d: dict, path: str, params: dict, dbg: Optional[Debu
     res = d.get("results")
     if isinstance(res, int) and res == 0:
         dbg.inc(dbg.counts, "api_payload_results_0")
-
 
 
 # =========================
@@ -387,7 +422,6 @@ class TeamHistory:
         return (sum(arr) / len(arr)) if arr else None
 
 
-
 # =========================
 # BLOCO 4/6 — BUILD HISTORY (stats opcionais, usa cache e respeita filtros)
 # =========================
@@ -424,6 +458,7 @@ def _fixture_teams_ok(fx: dict, team_id: int, context: str) -> bool:
             return False
         if looks_blocked_team(str(h.get("name") or "")):
             return False
+
     if looks_blocked_team(str(h.get("name") or "")):
         return False
     if looks_blocked_team(str(a.get("name") or "")):
@@ -543,6 +578,7 @@ def build_team_history(api_key: str, team_id: int, context: str, dbg: Optional[D
     _team_history_cache[key] = hist
     return hist
 
+
 # =========================
 # BLOCO 5/6 — PROBABILIDADES + CANDIDATOS + COMBOS
 # =========================
@@ -588,39 +624,28 @@ def btts_rate(gf_a: List[int], gf_b: List[int]) -> Optional[float]:
     return ok / n
 
 def compute_market_probs(home_hist: TeamHistory, away_hist: TeamHistory) -> Dict[str, Optional[float]]:
-    """
-    Calcula probabilidades simples para alguns mercados usando histórico HOME/AWAY.
-    """
     probs: Dict[str, Optional[float]] = {}
 
-    # Time marca (>=1)
     probs["home_scores"] = clamp_prob(rate_at_least_1(home_hist.gf))
     probs["away_scores"] = clamp_prob(rate_at_least_1(away_hist.gf))
 
-    # Ambos marcam
     probs["btts_yes"] = clamp_prob(btts_rate(home_hist.gf, away_hist.gf))
     probs["btts_no"] = (1.0 - probs["btts_yes"]) if probs["btts_yes"] is not None else None
 
-    # Gols do jogo (proxy: soma médias)
     mu_goals = None
     m_h = mean(home_hist.gf)
     m_a = mean(away_hist.gf)
     if m_h is not None and m_a is not None:
         mu_goals = m_h + m_a
 
-    # P(>1.5) e P(<3.5) via aproximação Poisson simples
     if mu_goals is not None:
         lam = max(0.01, mu_goals)
-        # P(X<=1) = e^-lam (1 + lam)
         p_le_1 = math.exp(-lam) * (1.0 + lam)
-        p_gt_1_5 = 1.0 - p_le_1
-        probs["over_1_5_goals"] = clamp_prob(p_gt_1_5)
+        probs["over_1_5_goals"] = clamp_prob(1.0 - p_le_1)
 
-        # P(X<=3) = e^-lam * sum_{k=0..3} lam^k/k!
         p_le_3 = math.exp(-lam) * (1.0 + lam + lam**2 / 2.0 + lam**3 / 6.0)
         probs["under_3_5_goals"] = clamp_prob(p_le_3)
 
-    # Escanteios (se disponível)
     tot_corners = []
     n = min(len(home_hist.corners_for), len(away_hist.corners_for))
     if n > 0:
@@ -630,7 +655,6 @@ def compute_market_probs(home_hist: TeamHistory, away_hist: TeamHistory) -> Dict
     probs["under_10_5_corners"] = clamp_prob(rate_under(tot_corners, 10.5))
     probs["over_7_5_corners"] = clamp_prob(rate_over(tot_corners, 7.5))
 
-    # Chutes a gol (se disponível)
     tot_sog = []
     n2 = min(len(home_hist.sog_for), len(away_hist.sog_for))
     if n2 > 0:
@@ -638,18 +662,12 @@ def compute_market_probs(home_hist: TeamHistory, away_hist: TeamHistory) -> Dict
             tot_sog.append(home_hist.sog_for[i] + away_hist.sog_for[i])
 
     probs["under_7_5_sog"] = clamp_prob(rate_under(tot_sog, 7.5))
-
-    # Visitante: under 3.5 SOG (usa sog_for do away)
     probs["away_under_3_5_sog"] = clamp_prob(rate_under(away_hist.sog_for, 3.5))
-    # Mandante: over 3.5 SOG (usa sog_for do home)
     probs["home_over_3_5_sog"] = clamp_prob(rate_over(home_hist.sog_for, 3.5))
 
     return probs
 
 def candidate_markets_from_probs(probs: Dict[str, Optional[float]]) -> List[dict]:
-    """
-    Monta lista de candidatos com label, prob (p), odd_book (odd com margem) e tipo.
-    """
     candidates: List[dict] = []
 
     def add(label: str, key: str):
@@ -692,7 +710,6 @@ def filter_candidates(cands: List[dict], dbg: Optional[DebugCollector] = None) -
                 dbg.inc(dbg.candidate_reject_reasons, "odd_out_of_range")
                 dbg.add_reject_sample(f"[ODD] {c['label']} odd={odd:.2f}")
             continue
-        # evita picks sem confiança mínima
         if c["p"] < 0.55:
             if dbg:
                 dbg.inc(dbg.candidate_reject_reasons, "p_too_low")
@@ -702,9 +719,6 @@ def filter_candidates(cands: List[dict], dbg: Optional[DebugCollector] = None) -
     return out
 
 def build_match_candidates(api_key: str, fx: dict, dbg: Optional[DebugCollector] = None) -> List[dict]:
-    """
-    Para um fixture do dia, monta candidatos usando histórico HOME/AWAY.
-    """
     fixture = fx.get("fixture") or {}
     teams = fx.get("teams") or {}
     league = fx.get("league") or {}
@@ -732,7 +746,6 @@ def build_match_candidates(api_key: str, fx: dict, dbg: Optional[DebugCollector]
     cands = candidate_markets_from_probs(probs)
     cands = filter_candidates(cands, dbg=dbg)
 
-    # metadata do jogo
     kickoff = to_int(fixture.get("timestamp")) or 0
     ctry = str(league.get("country") or "")
     lname = str(league.get("name") or "")
@@ -761,22 +774,13 @@ def select_best_legs_for_combo(
     size: int,
     dbg: Optional[DebugCollector] = None
 ) -> Tuple[List[dict], float]:
-    """
-    Seleciona legs evitando:
-      - repetir o mesmo fixture
-      - repetir o mesmo mercado (type) no combo
-    Heurística: maior p primeiro; desempate por odd (mais alta dentro do range)
-    Retorna (legs, odd_prod)
-    """
     if not all_cands:
         return [], 1.0
 
-    # ordena por p desc, odd desc
-    cands = sorted(all_cands, key=lambda x: (x["p"], x["odd_book"]), reverse=True)
+    cands = sorted(all_cands, key=lambda x: (x["odd_book"], x["p"]), reverse=True)
 
     legs: List[dict] = []
     used_fixture_ids = set()
-    used_types = set()
     used_leg_ids = set()
     prod = 1.0
 
@@ -786,13 +790,10 @@ def select_best_legs_for_combo(
         for c in cands:
             if c["fixture_id"] in used_fixture_ids:
                 continue
-            if c["type"] in used_types:
-                continue
             if c["leg_id"] in used_leg_ids:
                 continue
 
-            # score simples
-            key = (c["p"], c["odd_book"])
+            key = (c["odd_book"], c["p"])
             if best is None or key > best_key:
                 best, best_key = c, key
 
@@ -801,7 +802,6 @@ def select_best_legs_for_combo(
 
         legs.append(best)
         used_fixture_ids.add(best["fixture_id"])
-        used_types.add(best["type"])
         used_leg_ids.add(best["leg_id"])
         prod *= best["odd_book"]
 
@@ -829,7 +829,8 @@ def build_combos_for_day(
     combos: List[Tuple[List[dict], float]] = []
     for size in (2, 3, 4, 5):
         legs, prod = select_best_legs_for_combo(all_cands, size=size, dbg=dbg)
-        if len(legs) >= 2:
+        # só aceita combo COMPLETO (evita duplicar ~4 vindo de size=5 incompleto)
+        if len(legs) == size and len(legs) >= 2:
             combos.append((legs, prod))
     return combos
 
@@ -848,6 +849,128 @@ def build_all_candidates_for_day(api_key: str, day_fixtures: List[dict], dbg: Op
         dbg.candidates_by_type = by_type
     return all_cands
 
+def greedy_select_legs_for_target(
+    all_cands: List[dict],
+    target_odd: float,
+    seed_leg: Optional[dict] = None,
+    max_legs: int = 5,
+    dbg: Optional[DebugCollector] = None
+) -> Tuple[List[dict], float]:
+    if not all_cands:
+        return [], 1.0
+
+    cands = sorted(all_cands, key=lambda x: (x["odd_book"], x["p"]), reverse=True)
+
+    legs: List[dict] = []
+    used_leg_ids = set()
+    used_fixture_ids = set()
+    prod = 1.0
+
+    if seed_leg is not None:
+        legs.append(seed_leg)
+        used_leg_ids.add(seed_leg["leg_id"])
+        used_fixture_ids.add(seed_leg["fixture_id"])
+        prod *= seed_leg["odd_book"]
+
+    cur_delta = abs(target_odd - prod)
+
+    while len(legs) < max_legs:
+        best = None
+        best_key = None
+
+        for c in cands:
+            if c["leg_id"] in used_leg_ids:
+                continue
+            if c["fixture_id"] in used_fixture_ids:
+                continue
+
+            new_prod = prod * c["odd_book"]
+            delta = abs(target_odd - new_prod)
+
+            key = (-delta, c["odd_book"], c["p"])
+            if best is None or key > best_key:
+                best, best_key = c, key
+
+        if not best:
+            break
+
+        new_prod = prod * best["odd_book"]
+        new_delta = abs(target_odd - new_prod)
+
+        if new_delta + 1e-12 >= cur_delta:
+            break
+
+        legs.append(best)
+        used_leg_ids.add(best["leg_id"])
+        used_fixture_ids.add(best["fixture_id"])
+        prod = new_prod
+        cur_delta = new_delta
+
+    return legs, prod
+
+def build_target_combos(
+    all_cands: List[dict],
+    n_combos: int,
+    target_odd: float,
+    min_legs: int,
+    max_legs: int,
+    seed_pool: int,
+    dbg: Optional[DebugCollector] = None
+) -> List[Tuple[List[dict], float]]:
+    if not all_cands or n_combos <= 0:
+        return []
+
+    cands = sorted(all_cands, key=lambda x: (x["odd_book"], x["p"]), reverse=True)
+    seeds = cands[:max(1, min(len(cands), seed_pool))]
+
+    scored: List[Tuple[float, float, float, Tuple[str, ...], List[dict], float]] = []
+    seen: set[Tuple[str, ...]] = set()
+
+    for seed in seeds:
+        legs, prod = greedy_select_legs_for_target(
+            all_cands=cands,
+            target_odd=target_odd,
+            seed_leg=seed,
+            max_legs=max_legs,
+            dbg=dbg
+        )
+        if len(legs) < min_legs:
+            continue
+
+        key = tuple(sorted(l["leg_id"] for l in legs))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        delta = abs(target_odd - prod)
+        avg_odd = sum(l["odd_book"] for l in legs) / len(legs)
+        avg_p = sum(l["p"] for l in legs) / len(legs)
+
+        scored.append((delta, -avg_odd, -avg_p, key, legs, prod))
+
+    scored.sort(key=lambda x: (x[0], x[1], x[2]))
+    out: List[Tuple[List[dict], float]] = [(x[4], x[5]) for x in scored[:n_combos]]
+
+    if len(out) < n_combos:
+        legacy = build_combos_for_day(all_cands, dbg=dbg)
+        for legs, prod in legacy:
+            if len(out) >= n_combos:
+                break
+            key = tuple(sorted(l["leg_id"] for l in legs))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((legs, prod))
+
+    if dbg:
+        dbg.inc(dbg.counts, f"target_combos_generated_{len(out)}")
+
+    return out
+
+
+# =========================
+# BLOCO 6/6 — MAIN + DEBUG OUTPUT
+# =========================
 def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugCollector] = None) -> List[dict]:
     params = {"date": target_date, "timezone": "America/Sao_Paulo"}
     try:
@@ -861,7 +984,6 @@ def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugColle
     debug_check_api_payload(data, "/fixtures(date)", params, dbg)
     fx = data.get("response", []) or []
 
-    # filtra somente jogos futuros (no fuso) e campeonatos permitidos
     now_sp = dt.datetime.now(TZ)
     out = []
     for m in fx:
@@ -894,7 +1016,12 @@ def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugColle
 def build_picks_message(target_date: str, combos: List[Tuple[List[dict], float]]) -> str:
     out = []
     out.append(f"📅 Palpites para {target_date} (Brasília)")
-    out.append("Critérios: casa x fora (até 20 oficiais), min 10 amostras por mercado.\n")
+    out.append(
+        "Critérios: casa x fora (até 20 oficiais), min 10 amostras por mercado.\n"
+        f"Odds por perna: {MIN_ODD:.2f}–{MAX_ODD:.2f} | "
+        f"Objetivo: ~{TARGET_COMBO_ODD:.2f} | "
+        f"Qtd combos: {len(combos)}\n"
+    )
     for legs, prod in combos:
         out.append(format_combo(legs, prod))
         out.append("")
@@ -906,58 +1033,6 @@ def build_picks_message(target_date: str, combos: List[Tuple[List[dict], float]]
     out.append("• Ambos marcam: SIM (os dois fazem gol) / NÃO (apenas um ou nenhum).")
     return "\n".join(out).strip()
 
-def greedy_select_legs_for_target(
-    all_cands: List[dict],
-    target_odd: float,
-    dbg: Optional[DebugCollector] = None
-) -> Tuple[List[dict], float]:
-    """
-    Seleciona legs tentando chegar perto de um target de odd.
-    Evita repetir fixture e evita repetir type.
-    """
-    if not all_cands:
-        return [], 1.0
-
-    cands = sorted(all_cands, key=lambda x: (x["p"], x["odd_book"]), reverse=True)
-
-    legs: List[dict] = []
-    used_leg_ids = set()
-    used_types = set()
-    used_fixture_ids = set()
-    prod = 1.0
-
-    while prod < target_odd:
-        best = None
-        best_key = None
-        for c in cands:
-            if c["leg_id"] in used_leg_ids:
-                continue
-            if c["type"] in used_types:
-                continue
-            if c["fixture_id"] in used_fixture_ids:
-                continue
-
-            new_prod = prod * c["odd_book"]
-            # score: aproxima target sem passar muito + p alto
-            score = -abs(target_odd - new_prod) + (c["p"] * 0.15)
-            key = (score, c["p"], c["odd_book"])
-            if best is None or key > best_key:
-                best, best_key = c, key
-
-        if not best:
-            break
-
-        legs.append(best)
-        used_leg_ids.add(best["leg_id"])
-        used_fixture_ids.add(best["fixture_id"])
-        prod *= best["odd_book"]
-
-    return legs, prod
-
-
-# =========================
-# BLOCO 6/6 — MAIN + DEBUG OUTPUT
-# =========================
 def build_debug_report(dbg: DebugCollector) -> str:
     out = []
     out.append("==== DEBUG REPORT ====")
@@ -1024,22 +1099,29 @@ def main() -> None:
     dbg.api_calls_budget = API_CALL_BUDGET
     dbg.stats_calls_budget = STATS_CALL_BUDGET
 
-    # Seleciona fixtures do dia alvo
     day_fx = select_day_fixtures(api_key, target_date, dbg=dbg)
-    # Limita para evitar explosão de histórico
     day_fx = day_fx[:20]
 
-    # Constrói candidatos e combos
     all_cands = build_all_candidates_for_day(api_key, day_fx, dbg=dbg)
-    combos = build_combos_for_day(all_cands, dbg=dbg)
+
+    if N_TARGET_COMBOS > 0:
+        combos = build_target_combos(
+            all_cands=all_cands,
+            n_combos=N_TARGET_COMBOS,
+            target_odd=TARGET_COMBO_ODD,
+            min_legs=MIN_LEGS_TARGET,
+            max_legs=MAX_LEGS_TARGET,
+            seed_pool=SEED_POOL_TARGET,
+            dbg=dbg
+        )
+    else:
+        combos = build_combos_for_day(all_cands, dbg=dbg)
 
     msg = build_picks_message(target_date, combos)
 
-    # Envia mensagem principal
     try:
         send_telegram_message(tg_token, tg_chat_id, msg)
     except Exception as e:
-        # se falhar, tenta mandar algo menor
         try:
             send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar mensagem principal: {repr(e)}")
         except Exception:
@@ -1048,7 +1130,6 @@ def main() -> None:
     dbg.api_calls_used = API_CALLS
     dbg.stats_calls_used = STATS_CALLS
 
-    # Debug opcional
     send_debug = (os.getenv("SEND_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}
     if not send_debug:
         return
