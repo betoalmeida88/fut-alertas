@@ -148,7 +148,7 @@ BRAZIL_STATE_KEYWORDS = ["paulista", "carioca", "mineiro"]
  
 ALLOW: Dict[str, set[str]] = {
     "england": {"premier league", "championship", "fa cup", "efl cup", "league cup"},
-    "spain": {"la liga", "segunda division", "copa del rey", "supercopa de espana"},
+    "spain": {"la liga", "segunda division", "copa del rey", "supercopa de espana", "Super Cup", "Super Copa da Espanha"},
     "germany": {"bundesliga", "2 bundesliga", "dfb pokal", "dfl supercup"},
     "italy": {"serie a", "serie b", "coppa italia", "supercoppa italiana"},
     "france": {"ligue 1", "ligue 2", "coupe de france", "trophee des champions"},
