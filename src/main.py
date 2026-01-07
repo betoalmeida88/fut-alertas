@@ -37,8 +37,11 @@ EWMA_HALFLIFE_GAMES = float(os.getenv("EWMA_HALFLIFE_GAMES", "6.0"))
 BETA_PRIOR_ALPHA = float(os.getenv("BETA_PRIOR_ALPHA", "1.0"))
 BETA_PRIOR_BETA = float(os.getenv("BETA_PRIOR_BETA", "1.0"))
  
+# # Data padrão: jogos do DIA (fuso SP). 0 = hoje, 1 = amanhã, etc.
+# DEFAULT_TARGET_DATE_OFFSET_DAYS = int(os.getenv("DEFAULT_TARGET_DATE_OFFSET_DAYS", "0"))
+
 # Data padrão: jogos do DIA (fuso SP). 0 = hoje, 1 = amanhã, etc.
-DEFAULT_TARGET_DATE_OFFSET_DAYS = int(os.getenv("DEFAULT_TARGET_DATE_OFFSET_DAYS", "0"))
+DEFAULT_TARGET_DATE_OFFSET_DAYS = int(os.getenv("DEFAULT_TARGET_DATE_OFFSET_DAYS", "1"))
  
 # Preferências/garantias do portfólio (validadas no BLOCO 5)
 PREFER_SINGLE_FIXTURE_PER_COMBO = (
