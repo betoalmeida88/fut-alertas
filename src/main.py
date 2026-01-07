@@ -47,7 +47,8 @@ BLOCK_LEAGUE_WORDS = [
     "youth", "junior", "reserve", "reserves",
     "friendly", "friendlies", "amistoso", "amistosos", "treino", "test",
     "development", "academy",
-    "serie c", "serie d",
+    "serie c",
+    "serie d",
 ]
 BLOCK_TEAM_PATTERNS = [
     r"\b(u(1[5-9]|2[0-3]))\b",
@@ -83,9 +84,7 @@ ALLOW: Dict[str, set[str]] = {
     "argentina": {"liga profesional argentina", "primera division", "copa argentina"},
     "mexico": {"liga mx"},
     "usa": {"major league soccer", "mls", "us open cup"},
-
     "brazil": {"serie a", "serie b", "copa do brasil", "copa do nordeste", "supercopa do brasil"},
-
     "world": {
         "uefa champions league", "uefa europa league", "uefa europa conference league",
         "uefa super cup", "copa libertadores", "copa sudamericana", "recopa sudamericana",
@@ -129,13 +128,8 @@ def is_allowed_competition(country: str, league_name: str) -> bool:
             return True
         return False
     if key in ALLOW:
-        if nl in ALLOW[key]:
-            return True
-        return False
+        return nl in ALLOW[key]
     return False
-
-
-
 
 # =========================
 # BLOCO 2/6 — API + TELEGRAM + DEBUG + BUDGET (sem crash)
@@ -280,6 +274,8 @@ def debug_check_api_payload(d: dict, path: str, params: dict, dbg: Optional[Debu
     if isinstance(res, int) and res == 0:
         dbg.inc(dbg.counts, "api_payload_results_0")
 
+
+
 # =========================
 # BLOCO 3/6 — FIXTURES + STATS (com budget de stats e cache)
 # =========================
@@ -389,6 +385,8 @@ class TeamHistory:
 
     def mean(self, arr: List[int]) -> Optional[float]:
         return (sum(arr) / len(arr)) if arr else None
+
+
 
 # =========================
 # BLOCO 4/6 — BUILD HISTORY (stats opcionais, usa cache e respeita filtros)
@@ -544,7 +542,6 @@ def build_team_history(api_key: str, team_id: int, context: str, dbg: Optional[D
 
     _team_history_cache[key] = hist
     return hist
-
 
 # =========================
 # BLOCO 5/6 — PROBABILIDADES + CANDIDATOS + COMBOS
@@ -1010,11 +1007,12 @@ def build_debug_report(dbg: DebugCollector) -> str:
     return "\n".join(out).strip()
 
 def main() -> None:
-    api_key = os.getenv("API_FOOTBALL_KEY") or ""
-    tg_token = os.getenv("TG_BOT_TOKEN") or ""
-    tg_chat_id = os.getenv("TG_CHAT_ID") or ""
+    api_key = os.environ.get("APISPORTS_KEY", "").strip()
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
     if not api_key or not tg_token or not tg_chat_id:
-        raise SystemExit("Faltam envs: API_FOOTBALL_KEY, TG_BOT_TOKEN, TG_CHAT_ID")
+        raise SystemExit("Faltam envs: APISPORTS_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
 
     now_sp = dt.datetime.now(TZ)
     t_date = (now_sp + dt.timedelta(days=1)).date().isoformat()
@@ -1064,7 +1062,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
+    
