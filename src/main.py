@@ -1,33 +1,37 @@
+# =========================
+# BLOCO 1/5 — CONFIG + FILTROS
+# =========================
 import os
 import math
 import re
 import time
 import unicodedata
 import datetime as dt
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 BASE_URL = "https://v3.football.api-sports.io"
 TZ = ZoneInfo("America/Sao_Paulo")
-
-# ✅ Histórico real exigido (não inventa/fallback)
-LAST_N = 10
-HISTORY_LAST_FETCH = 80  # últimos 80 jogos para garantir que ache 10 finalizados
-
-# ✅ Odds por perna (já com margem)
-MIN_ODD = 1.15
-MAX_ODD = 1.50
-BOOK_MARGIN = 0.07  # 7%
-
-# ✅ Controle para não estourar plano free
-API_CALL_BUDGET = 95
-API_CALLS = 0
-
 FINISHED_STATUSES = {"FT", "AET", "PEN"}
 
-# ✅ Bloqueio agressivo (somente masculino/profissional)
+# Odds estimadas (com margem)
+MIN_ODD = float(os.getenv("MIN_ODD", "1.15"))
+MAX_ODD = float(os.getenv("MAX_ODD", "1.50"))
+BOOK_MARGIN = float(os.getenv("BOOK_MARGIN", "0.07"))  # 7%
+
+# Histórico
+HIST_MAX_GAMES = int(os.getenv("HIST_MAX_GAMES", "20"))     # queremos até 20
+HIST_MIN_GAMES = int(os.getenv("HIST_MIN_GAMES", "10"))     # mínimo 10
+HISTORY_LAST_FETCH = int(os.getenv("HISTORY_LAST_FETCH", "140"))  # busca ampla p/ achar 20 válidos
+
+# Budget (Pro aguenta mais; ainda assim deixa controlado)
+API_CALL_BUDGET = int(os.getenv("API_CALL_BUDGET", "450"))
+API_CALLS = 0
+
+# Bloqueios (masc/profissional + sem amistosos)
 BLOCK_LEAGUE_WORDS = [
     "women", "woman", "femin", "feminino", "femenino", "femenil",
     "u23", "u22", "u21", "u20", "u19", "u18", "u17", "u16", "u15",
@@ -36,13 +40,12 @@ BLOCK_LEAGUE_WORDS = [
     "development", "academy",
 ]
 
-# times B/II, etc (evita Barcelona B / Valencia II)
 BLOCK_TEAM_PATTERNS = [
-    r"\b(u(1[5-9]|2[0-3]))\b",           # U15..U23
+    r"\b(u(1[5-9]|2[0-3]))\b",
     r"\b(women|woman|femin)\b",
     r"\b(reserve|reserves)\b",
-    r"\b(ii|iii)\b$",                    # termina com II/III
-    r"\b(b)\b$",                         # termina com "B"
+    r"\b(ii|iii)\b$",
+    r"\b(b)\b$",
 ]
 
 COUNTRY_ALIASES = {
@@ -65,103 +68,35 @@ COUNTRY_ALIASES = {
     "international": "world",
 }
 
-# ✅ Competições principais (masculino/profissional)
-ALLOW = {
-    "england": {
-        "premier league",
-        "championship",
-        "fa cup",
-        "efl cup",
-        "league cup",
-    },
-    "spain": {
-        "la liga",
-        "segunda division",
-        "copa del rey",
-        "supercopa de espana",
-    },
-    "germany": {
-        "bundesliga",
-        "2 bundesliga",
-        "dfb pokal",
-        "dfl supercup",
-    },
-    "italy": {
-        "serie a",
-        "serie b",
-        "coppa italia",
-        "supercoppa italiana",
-    },
-    "france": {
-        "ligue 1",
-        "ligue 2",
-        "coupe de france",
-        "trophee des champions",
-    },
-    "portugal": {
-        "primeira liga",
-        "taca de portugal",
-        "supertaca candido de oliveira",
-    },
-    "netherlands": {
-        "eredivisie",
-        "knvb beker",
-        "johan cruijff schaal",
-    },
-    "belgium": {
-        "jupiler pro league",
-        "pro league",
-        "belgian cup",
-        "croky cup",
-    },
-    "turkey": {
-        "super lig",
-        "turkish cup",
-    },
-    "scotland": {
-        "premiership",
-        "scottish cup",
-    },
-    "argentina": {
-        "liga profesional argentina",
-        "primera division",
-        "copa argentina",
-    },
-    "mexico": {
-        "liga mx",
-    },
-    "usa": {
-        "major league soccer",
-        "mls",
-        "us open cup",
-    },
-    "brazil": {
-        "serie a",
-        "serie b",
-        "serie c",
-        "copa do brasil",
-        "copa do nordeste",
-        "supercopa do brasil",
-    },
+# Apenas estaduais BR permitidos
+BRAZIL_STATE_KEYWORDS = ["paulista", "carioca", "mineiro"]
+
+# Competições principais (jogos do "dia")
+ALLOW: Dict[str, set[str]] = {
+    "england": {"premier league", "championship", "fa cup", "efl cup", "league cup"},
+    "spain": {"la liga", "segunda division", "copa del rey", "supercopa de espana"},
+    "germany": {"bundesliga", "2 bundesliga", "dfb pokal", "dfl supercup"},
+    "italy": {"serie a", "serie b", "coppa italia", "supercoppa italiana"},
+    "france": {"ligue 1", "ligue 2", "coupe de france", "trophee des champions"},
+    "portugal": {"primeira liga", "taca de portugal", "supertaca candido de oliveira"},
+    "netherlands": {"eredivisie", "knvb beker", "johan cruijff schaal"},
+    "belgium": {"jupiler pro league", "pro league", "belgian cup", "croky cup"},
+    "turkey": {"super lig", "turkish cup"},
+    "scotland": {"premiership", "scottish cup"},
+    "argentina": {"liga profesional argentina", "primera division", "copa argentina"},
+    "mexico": {"liga mx"},
+    "usa": {"major league soccer", "mls", "us open cup"},
+    "brazil": {"serie a", "serie b", "serie c", "copa do brasil", "copa do nordeste", "supercopa do brasil"},
     "world": {
-        "uefa champions league",
-        "uefa europa league",
-        "uefa europa conference league",
-        "uefa super cup",
-        "copa libertadores",
-        "copa sudamericana",
-        "recopa sudamericana",
-        "fifa club world cup",
-        "club world cup",
+        # clubes
+        "uefa champions league", "uefa europa league", "uefa europa conference league",
+        "uefa super cup", "copa libertadores", "copa sudamericana", "recopa sudamericana",
+        "fifa club world cup", "club world cup",
+        # seleções (oficiais)
+        "world cup", "euro championship", "copa america", "uefa nations league",
+        "africa cup of nations", "afcon", "asian cup", "concacaf gold cup",
     },
 }
-
-# ✅ Estaduais principais (1ª divisão) — por contém
-BRAZIL_STATE_KEYWORDS = [
-    "paulista", "carioca", "mineiro", "gaucho", "gaúcho",
-    "paranaense", "catarinense", "baiano", "pernambucano",
-    "cearense", "goiano", "paraense",
-]
 
 
 def norm(s: str) -> str:
@@ -196,35 +131,41 @@ def is_allowed_competition(country: str, league_name: str) -> bool:
 
     key = COUNTRY_ALIASES.get(nc, nc)
 
+    # World: usa "contains" para cobrir variações
     if key == "world":
-        return nl in ALLOW["world"]
+        for allowed in ALLOW["world"]:
+            if allowed in nl:
+                return True
+        return False
 
+    # Brasil: principais + estaduais (somente paulista/carioca/mineiro) — evita A2/A3 etc
     if key == "brazil":
         if nl in ALLOW["brazil"]:
             return True
-
-        # estaduais principais (evita A2/A3 e divisões inferiores por nome)
-        if any(norm(k) in nl for k in BRAZIL_STATE_KEYWORDS):
+        if any(k in nl for k in BRAZIL_STATE_KEYWORDS):
             if "a2" in nl or "a3" in nl:
-                return False
-            if "u2" in nl or "u1" in nl:
                 return False
             if looks_blocked_text(nl):
                 return False
             return True
-
         return False
 
+    # Demais países: match exato (estável) + fallback por contains p/ pequenas variações
     if key in ALLOW:
-        return nl in ALLOW[key]
+        if nl in ALLOW[key]:
+            return True
+        for allowed in ALLOW[key]:
+            if allowed in nl:
+                return True
+        return False
 
     return False
 
 
-def api_request(method: str, path: str, api_key: str, params: dict | None = None, data: dict | None = None) -> dict:
-    """
-    Sincrono (1 por vez) + retry em 429/5xx.
-    """
+# =========================
+# BLOCO 2/5 — API + HISTÓRICO CASA/FORA + STATS
+# =========================
+def api_request(method: str, path: str, api_key: str, params: dict | None = None) -> dict:
     global API_CALLS
     if API_CALLS >= API_CALL_BUDGET:
         raise RuntimeError(f"API budget excedido ({API_CALLS}/{API_CALL_BUDGET}).")
@@ -239,7 +180,7 @@ def api_request(method: str, path: str, api_key: str, params: dict | None = None
             if method.upper() == "GET":
                 r = requests.get(url, headers=headers, params=params or {}, timeout=30)
             else:
-                r = requests.post(url, headers=headers, params=params or {}, data=data or {}, timeout=30)
+                r = requests.post(url, headers=headers, params=params or {}, timeout=30)
 
             if r.status_code == 429:
                 retry_after = r.headers.get("Retry-After")
@@ -255,7 +196,6 @@ def api_request(method: str, path: str, api_key: str, params: dict | None = None
 
             r.raise_for_status()
             return r.json()
-
         except requests.RequestException:
             time.sleep(min(10.0, backoff))
             backoff = min(10.0, backoff * 1.6)
@@ -269,14 +209,225 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
     r.raise_for_status()
 
 
-def send_telegram_document(token: str, chat_id: str, file_path: str, caption: str | None = None) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-    with open(file_path, "rb") as f:
-        data = {"chat_id": chat_id}
-        if caption:
-            data["caption"] = caption
-        r = requests.post(url, data=data, files={"document": f}, timeout=60)
-        r.raise_for_status()
+def to_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except ValueError:
+            return None
+    return None
+
+
+# Cache de stats por fixture (muito importante p/ não explodir chamadas)
+_fixture_stats_cache: Dict[int, Dict[int, Dict[str, Optional[int]]]] = {}
+_team_fixtures_cache: Dict[int, List[dict]] = {}
+
+
+def get_fixture_stats(api_key: str, fixture_id: int) -> Dict[int, Dict[str, Optional[int]]]:
+    """
+    Retorna: {team_id: {"corners":int|None, "sog":int|None, "yellow":int|None, "red":int|None}}
+    """
+    if fixture_id in _fixture_stats_cache:
+        return _fixture_stats_cache[fixture_id]
+
+    data = api_request("GET", "/fixtures/statistics", api_key, params={"fixture": fixture_id})
+    resp = data.get("response", []) or []
+
+    # normaliza chaves possíveis
+    def pick(stat_list: List[dict], keys: List[str]) -> Optional[int]:
+        for s in stat_list:
+            t = (s.get("type") or "").strip().lower()
+            if any(k.lower() == t for k in keys):
+                return to_int(s.get("value"))
+        return None
+
+    out: Dict[int, Dict[str, Optional[int]]] = {}
+    for row in resp:
+        team = row.get("team", {}) or {}
+        tid = to_int(team.get("id"))
+        if tid is None:
+            continue
+        stats = row.get("statistics", []) or []
+        corners = pick(stats, ["Corner Kicks"])
+        sog = pick(stats, ["Shots on Goal", "Shots on Target"])
+        yellow = pick(stats, ["Yellow Cards"])
+        red = pick(stats, ["Red Cards"])
+        out[int(tid)] = {"corners": corners, "sog": sog, "yellow": yellow, "red": red}
+
+    _fixture_stats_cache[fixture_id] = out
+    return out
+
+
+def get_team_fixtures(api_key: str, team_id: int) -> List[dict]:
+    """
+    Busca últimos N jogos do time (mistura competições), depois filtramos.
+    """
+    if team_id in _team_fixtures_cache:
+        return _team_fixtures_cache[team_id]
+
+    data = api_request(
+        "GET",
+        "/fixtures",
+        api_key,
+        params={
+            "team": team_id,
+            "last": HISTORY_LAST_FETCH,
+            "timezone": "America/Sao_Paulo",
+        },
+    )
+    fx = data.get("response", []) or []
+    _team_fixtures_cache[team_id] = fx
+    return fx
+
+
+@dataclass
+class TeamHistory:
+    team_id: int
+    context: str  # "home" ou "away"
+    n_games: int = 0
+
+    gf: List[int] = field(default_factory=list)
+    ga: List[int] = field(default_factory=list)
+
+    corners_for: List[int] = field(default_factory=list)
+    corners_against: List[int] = field(default_factory=list)
+
+    cards_for: List[int] = field(default_factory=list)
+    cards_against: List[int] = field(default_factory=list)
+
+    sog_for: List[int] = field(default_factory=list)
+    sog_against: List[int] = field(default_factory=list)
+
+    def has_min_games(self) -> bool:
+        return self.n_games >= HIST_MIN_GAMES
+
+    def valid_count(self, arr: List[int]) -> int:
+        return len(arr)
+
+    def mean(self, arr: List[int]) -> Optional[float]:
+        return (sum(arr) / len(arr)) if arr else None
+
+
+_team_history_cache: Dict[Tuple[int, str], TeamHistory] = {}
+
+
+def build_team_history(api_key: str, team_id: int, context: str) -> TeamHistory:
+    """
+    Contexto:
+      - "home": apenas jogos onde o time foi mandante
+      - "away": apenas jogos onde o time foi visitante
+
+    Regras:
+      - somente jogos finalizados
+      - excluir amistosos (por texto) e times não-oficiais
+      - NÃO limita por campeonato (mistura tudo oficial)
+      - coleta até 20 jogos; exige mínimo 10 para "usar"
+      - para corners/cards/sog: só conta jogo se houver dado (>=0)
+    """
+    key = (team_id, context)
+    if key in _team_history_cache:
+        return _team_history_cache[key]
+
+    hist = TeamHistory(team_id=team_id, context=context)
+    fx = get_team_fixtures(api_key, team_id)
+
+    for f in fx:
+        if hist.n_games >= HIST_MAX_GAMES:
+            break
+
+        fixture = f.get("fixture", {}) or {}
+        status = ((fixture.get("status", {}) or {}).get("short") or "").strip()
+        if status not in FINISHED_STATUSES:
+            continue
+
+        league = f.get("league", {}) or {}
+        league_name = league.get("name", "") or ""
+        if looks_blocked_text(league_name):
+            continue  # elimina friendlies/amistosos e afins
+
+        teams = f.get("teams", {}) or {}
+        home = teams.get("home", {}) or {}
+        away = teams.get("away", {}) or {}
+        home_id = to_int(home.get("id"))
+        away_id = to_int(away.get("id"))
+        if home_id is None or away_id is None:
+            continue
+
+        home_name = home.get("name", "") or ""
+        away_name = away.get("name", "") or ""
+        if looks_blocked_team(home_name) or looks_blocked_team(away_name):
+            continue
+
+        is_home = int(home_id) == int(team_id)
+        is_away = int(away_id) == int(team_id)
+        if context == "home" and not is_home:
+            continue
+        if context == "away" and not is_away:
+            continue
+
+        goals = f.get("goals", {}) or {}
+        gh = to_int(goals.get("home"))
+        ga = to_int(goals.get("away"))
+        if gh is None or ga is None:
+            continue
+
+        # gols for/against no contexto certo
+        if is_home:
+            gf, ga_ = int(gh), int(ga)
+            opp_id = int(away_id)
+        else:
+            gf, ga_ = int(ga), int(gh)
+            opp_id = int(home_id)
+
+        hist.gf.append(gf)
+        hist.ga.append(ga_)
+        hist.n_games += 1
+
+        fixture_id = to_int(fixture.get("id"))
+        if fixture_id is None:
+            continue
+
+        # stats (se vierem)
+        st = get_fixture_stats(api_key, int(fixture_id))
+        me = st.get(int(team_id), {})
+        opp = st.get(int(opp_id), {})
+
+        corners_me = to_int(me.get("corners"))
+        corners_opp = to_int(opp.get("corners"))
+        if corners_me is not None and corners_opp is not None:
+            hist.corners_for.append(int(corners_me))
+            hist.corners_against.append(int(corners_opp))
+
+        sog_me = to_int(me.get("sog"))
+        sog_opp = to_int(opp.get("sog"))
+        if sog_me is not None and sog_opp is not None:
+            hist.sog_for.append(int(sog_me))
+            hist.sog_against.append(int(sog_opp))
+
+        y_me, r_me = to_int(me.get("yellow")), to_int(me.get("red"))
+        y_opp, r_opp = to_int(opp.get("yellow")), to_int(opp.get("red"))
+        if y_me is not None and r_me is not None and y_opp is not None and r_opp is not None:
+            hist.cards_for.append(int(y_me + r_me))
+            hist.cards_against.append(int(y_opp + r_opp))
+
+    _team_history_cache[key] = hist
+    return hist
+
+
+# =========================
+# BLOCO 3/5 — PROBABILIDADES + GERAÇÃO DE PERNAS (7 MERCADOS)
+# =========================
+def odds_with_margin(p: float) -> float:
+    p = max(0.0001, min(0.9999, float(p)))
+    p_adj = min(0.9999, p * (1.0 + BOOK_MARGIN))
+    return 1.0 / p_adj
 
 
 def poisson_probs(lam: float, max_k: int = 10) -> List[float]:
@@ -294,7 +445,7 @@ def match_probs(lh: float, la: float, max_g: int = 10) -> Dict[str, float]:
     pa = poisson_probs(la, max_g)
 
     p_home_win = p_draw = p_away_win = 0.0
-    p_total_leq_1 = p_total_leq_3 = p_total_leq_4 = 0.0
+    p_total_leq = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
 
     for i in range(max_g + 1):
         for j in range(max_g + 1):
@@ -305,84 +456,256 @@ def match_probs(lh: float, la: float, max_g: int = 10) -> Dict[str, float]:
                 p_draw += p
             else:
                 p_away_win += p
-
-            if i + j <= 1:
-                p_total_leq_1 += p
-            if i + j <= 3:
-                p_total_leq_3 += p
-            if i + j <= 4:
-                p_total_leq_4 += p
+            s = i + j
+            for k in p_total_leq:
+                if s <= k:
+                    p_total_leq[k] += p
 
     return {
         "home_win": p_home_win,
         "draw": p_draw,
         "away_win": p_away_win,
-        "over_1_5": 1.0 - p_total_leq_1,
-        "under_3_5": p_total_leq_3,
-        "under_4_5": p_total_leq_4,
+        "over_1_5": 1.0 - p_total_leq[1],
+        "over_2_5": 1.0 - p_total_leq[2],
+        "under_3_5": p_total_leq[3],
+        "under_4_5": p_total_leq[4],
         "home_score_1+": 1.0 - ph[0],
         "away_score_1+": 1.0 - pa[0],
     }
 
 
-def odds_with_margin(p: float) -> float:
-    p = max(0.0001, min(0.9999, float(p)))
-    p_adj = min(0.9999, p * (1.0 + BOOK_MARGIN))
-    return 1.0 / p_adj
+def freq_over(arr: List[int], line: float) -> Tuple[Optional[float], int]:
+    if len(arr) < HIST_MIN_GAMES:
+        return None, len(arr)
+    win = sum(1 for x in arr if x > line)
+    return win / len(arr), len(arr)
 
 
+def freq_under(arr: List[int], line: float) -> Tuple[Optional[float], int]:
+    if len(arr) < HIST_MIN_GAMES:
+        return None, len(arr)
+    win = sum(1 for x in arr if x < line)
+    return win / len(arr), len(arr)
 
-def get_last10_team_avgs(api_key: str, team_id: int) -> Tuple[float, float, int]:
+
+def safe_add_candidate(
+    candidates: List[dict],
+    fixture_id: int,
+    leg_code: str,
+    label: str,
+    p: Optional[float],
+    sample_n: int,
+    meta: dict,
+) -> None:
+    if p is None:
+        return
+    if sample_n < HIST_MIN_GAMES:
+        return
+    odd = odds_with_margin(p)
+    if MIN_ODD <= odd <= MAX_ODD:
+        candidates.append(
+            {
+                "fixture_id": fixture_id,
+                "leg_id": f"{fixture_id}:{leg_code}",
+                "label": label,
+                "p": float(p),
+                "odd_book": float(odd),
+                "sample_n": sample_n,
+                **meta,
+            }
+        )
+
+
+def expected_goals_from_hist(home_h: TeamHistory, away_h: TeamHistory) -> Tuple[Optional[float], Optional[float]]:
     """
-    Últimos 10 jogos FINALIZADOS (qualquer ano). Sem fallback.
-    Retorna: (avg_gf, avg_ga, n_finalizados)
+    Modelo mais preciso: manda (casa) x visitante (fora)
+    E[GH] ~ média( ataque_casa_mandante , defesa_fora_visitante )
+    E[GA] ~ média( ataque_fora_visitante , defesa_casa_mandante )
     """
-    data = api_request(
-        "GET",
-        "/fixtures",
-        api_key,
-        params={
-            "team": team_id,
-            "last": HISTORY_LAST_FETCH,
-            "timezone": "America/Sao_Paulo",
-        },
-    )
-    fx = data.get("response", []) or []
+    if not home_h.has_min_games() and not away_h.has_min_games():
+        return None, None
 
-    gf: List[int] = []
-    ga: List[int] = []
+    home_attack = home_h.mean(home_h.gf) if home_h.has_min_games() else None
+    home_def = home_h.mean(home_h.ga) if home_h.has_min_games() else None
+    away_attack = away_h.mean(away_h.gf) if away_h.has_min_games() else None
+    away_def = away_h.mean(away_h.ga) if away_h.has_min_games() else None
 
-    for f in fx:
-        st = ((f.get("fixture", {}) or {}).get("status", {}) or {}).get("short", "")
-        if st not in FINISHED_STATUSES:
-            continue
+    # E[home goals]
+    parts_h = [x for x in [home_attack, away_def] if x is not None]
+    eh = (sum(parts_h) / len(parts_h)) if parts_h else None
 
-        home_id = int(f["teams"]["home"]["id"])
-        away_id = int(f["teams"]["away"]["id"])
-        gh = f.get("goals", {}).get("home", None)
-        ga_ = f.get("goals", {}).get("away", None)
-        if gh is None or ga_ is None:
-            continue
+    # E[away goals]
+    parts_a = [x for x in [away_attack, home_def] if x is not None]
+    ea = (sum(parts_a) / len(parts_a)) if parts_a else None
 
-        gh = int(gh)
-        ga_ = int(ga_)
-
-        if team_id == home_id:
-            gf.append(gh)
-            ga.append(ga_)
-        elif team_id == away_id:
-            gf.append(ga_)
-            ga.append(gh)
-
-        if len(gf) >= LAST_N:
-            break
-
-    if len(gf) < LAST_N:
-        return 0.0, 0.0, len(gf)
-
-    return sum(gf) / len(gf), sum(ga) / len(ga), len(gf)
+    if eh is not None:
+        eh = max(0.2, float(eh))
+    if ea is not None:
+        ea = max(0.2, float(ea))
+    return eh, ea
 
 
+def build_candidates_for_match(
+    fixture: dict,
+    home_hist: TeamHistory,
+    away_hist: TeamHistory,
+) -> List[dict]:
+    """
+    Gera pernas SOMENTE nos 7 mercados definidos.
+    Regras:
+      - Se ambos têm >=10 (no contexto), habilita mercados de "jogo" (resultado, total, BTTS etc).
+      - Se só um tem >=10, gera apenas mercados "solo" daquele time (gols/time, corners/time, cards/time, sog/time).
+      - Para corners/cards/sog: só gera se houver >=10 amostras válidas daquele dado.
+    """
+    fixture_id = int((fixture.get("fixture", {}) or {}).get("id"))
+    league = (fixture.get("league", {}) or {}).get("name", "") or ""
+    country = (fixture.get("league", {}) or {}).get("country", "") or ""
+    kickoff = dt.datetime.fromisoformat((fixture.get("fixture", {}) or {}).get("date")).strftime("%H:%M")
+
+    home = ((fixture.get("teams", {}) or {}).get("home", {}) or {}).get("name", "") or ""
+    away = ((fixture.get("teams", {}) or {}).get("away", {}) or {}).get("name", "") or ""
+
+    meta_common = {"league": league, "country": country, "kickoff": kickoff, "home": home, "away": away}
+
+    candidates: List[dict] = []
+
+    home_ok = home_hist.has_min_games()
+    away_ok = away_hist.has_min_games()
+
+    # ========= GOALS / RESULTADO / DUPLA CHANCE / BTTS =========
+    eh, ea = expected_goals_from_hist(home_hist, away_hist)
+
+    if home_ok and away_ok and eh is not None and ea is not None:
+        probs = match_probs(eh, ea)
+
+        # Vitória seca
+        safe_add_candidate(candidates, fixture_id, "1", "Vitória do mandante (1)", probs["home_win"], HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "2", "Vitória do visitante (2)", probs["away_win"], HIST_MAX_GAMES, meta_common)
+
+        # Dupla chance
+        safe_add_candidate(candidates, fixture_id, "1X", "Dupla chance (1X)", probs["home_win"] + probs["draw"], HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "X2", "Dupla chance (X2)", probs["away_win"] + probs["draw"], HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "12", "Dupla chance (12 — sem empate)", probs["home_win"] + probs["away_win"], HIST_MAX_GAMES, meta_common)
+
+        # Mais/Menos gols (jogo)
+        safe_add_candidate(candidates, fixture_id, "G_O15", "Mais de 1.5 gols (jogo)", probs["over_1_5"], HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "G_O25", "Mais de 2.5 gols (jogo)", probs["over_2_5"], HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "G_U35", "Menos de 3.5 gols (jogo)", probs["under_3_5"], HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "G_U45", "Menos de 4.5 gols (jogo)", probs["under_4_5"], HIST_MAX_GAMES, meta_common)
+
+        # Ambos marcam / apenas um time marca
+        p_h_scores = probs["home_score_1+"]
+        p_a_scores = probs["away_score_1+"]
+
+        # Aproximação: independência (boa o suficiente p/ filtro de odds)
+        p_btts_yes = p_h_scores * p_a_scores
+        p_btts_no = 1.0 - p_btts_yes
+
+        safe_add_candidate(candidates, fixture_id, "BTTS_Y", "Ambos marcam — SIM", p_btts_yes, HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "BTTS_N", "Ambos marcam — NÃO", p_btts_no, HIST_MAX_GAMES, meta_common)
+
+        # “apenas um time marca” (variantes)
+        safe_add_candidate(candidates, fixture_id, "H_1+", "Mandante marca (>=1)", p_h_scores, HIST_MAX_GAMES, meta_common)
+        safe_add_candidate(candidates, fixture_id, "A_1+", "Visitante marca (>=1)", p_a_scores, HIST_MAX_GAMES, meta_common)
+
+    else:
+        # Modo SOLO: só o time que tiver dados gera mercados de gols do próprio time
+        if home_ok and (eh is not None):
+            # prob do mandante marcar (>=1) pela própria média (Poisson)
+            p = 1.0 - poisson_probs(eh, 10)[0]
+            safe_add_candidate(candidates, fixture_id, "H_1+_SOLO", "Mandante marca (>=1)", p, home_hist.n_games, meta_common)
+
+        if away_ok and (ea is not None):
+            p = 1.0 - poisson_probs(ea, 10)[0]
+            safe_add_candidate(candidates, fixture_id, "A_1+_SOLO", "Visitante marca (>=1)", p, away_hist.n_games, meta_common)
+
+    # ========= CORNERS / CARDS / SOG =========
+    # Regras por mercado: precisa ter >=10 amostras válidas do dado
+    # Linhas conservadoras (tendem a cair no range 1.15–1.50 quando há consistência)
+    CORNERS_TOTAL_LINES = [7.5, 8.5, 9.5, 10.5]
+    CORNERS_TEAM_LINES = [3.5, 4.5, 5.5]
+    CARDS_TOTAL_LINES = [2.5, 3.5, 4.5, 5.5]
+    CARDS_TEAM_LINES = [1.5, 2.5, 3.5]
+    SOG_TOTAL_LINES = [6.5, 7.5, 8.5, 9.5]
+    SOG_TEAM_LINES = [2.5, 3.5, 4.5]
+
+    # Helpers de séries
+    def total_series(h: TeamHistory, kind: str) -> List[int]:
+        if kind == "corners":
+            return [a + b for a, b in zip(h.corners_for, h.corners_against)]
+        if kind == "cards":
+            return [a + b for a, b in zip(h.cards_for, h.cards_against)]
+        if kind == "sog":
+            return [a + b for a, b in zip(h.sog_for, h.sog_against)]
+        return []
+
+    # Mercados "TOTAL DO JOGO" (precisa dos dois times com dado suficiente)
+    # Faz média das frequências do contexto mandante (casa) e visitante (fora).
+    def add_total_market(kind: str, line: float, over: bool) -> None:
+        h_ser = total_series(home_hist, kind)
+        a_ser = total_series(away_hist, kind)
+        if len(h_ser) < HIST_MIN_GAMES or len(a_ser) < HIST_MIN_GAMES:
+            return
+        ph = (sum(1 for x in h_ser if x > line) / len(h_ser)) if over else (sum(1 for x in h_ser if x < line) / len(h_ser))
+        pa = (sum(1 for x in a_ser if x > line) / len(a_ser)) if over else (sum(1 for x in a_ser if x < line) / len(a_ser))
+        p = (ph + pa) / 2.0
+        code = f"{kind.upper()}_{'O' if over else 'U'}_{str(line).replace('.','')}"
+        label = f"{'Mais' if over else 'Menos'} de {line} {('escanteios' if kind=='corners' else 'cartões' if kind=='cards' else 'chutes a gol')} (jogo)"
+        safe_add_candidate(candidates, fixture_id, code, label, p, min(len(h_ser), len(a_ser)), meta_common)
+
+    for line in CORNERS_TOTAL_LINES:
+        add_total_market("corners", line, over=True)
+        add_total_market("corners", line, over=False)
+
+    for line in CARDS_TOTAL_LINES:
+        add_total_market("cards", line, over=True)
+        add_total_market("cards", line, over=False)
+
+    for line in SOG_TOTAL_LINES:
+        add_total_market("sog", line, over=True)
+        add_total_market("sog", line, over=False)
+
+    # Mercados "POR TIME" (permite SOLO)
+    def add_team_market(team_side: str, kind: str, line: float, over: bool) -> None:
+        h = home_hist if team_side == "home" else away_hist
+        arr = (
+            h.corners_for if kind == "corners" else
+            h.cards_for if kind == "cards" else
+            h.sog_for
+        )
+        if len(arr) < HIST_MIN_GAMES:
+            return
+        p = (sum(1 for x in arr if x > line) / len(arr)) if over else (sum(1 for x in arr if x < line) / len(arr))
+        code = f"{team_side[0].upper()}{kind.upper()}_{'O' if over else 'U'}_{str(line).replace('.','')}"
+        side_label = "Mandante" if team_side == "home" else "Visitante"
+        label_kind = "escanteios" if kind == "corners" else "cartões" if kind == "cards" else "chutes a gol"
+        label = f"{side_label}: {'Mais' if over else 'Menos'} de {line} {label_kind}"
+        safe_add_candidate(candidates, fixture_id, code, label, p, len(arr), meta_common)
+
+    for line in CORNERS_TEAM_LINES:
+        add_team_market("home", "corners", line, over=True)
+        add_team_market("home", "corners", line, over=False)
+        add_team_market("away", "corners", line, over=True)
+        add_team_market("away", "corners", line, over=False)
+
+    for line in CARDS_TEAM_LINES:
+        add_team_market("home", "cards", line, over=True)
+        add_team_market("home", "cards", line, over=False)
+        add_team_market("away", "cards", line, over=True)
+        add_team_market("away", "cards", line, over=False)
+
+    for line in SOG_TEAM_LINES:
+        add_team_market("home", "sog", line, over=True)
+        add_team_market("home", "sog", line, over=False)
+        add_team_market("away", "sog", line, over=True)
+        add_team_market("away", "sog", line, over=False)
+
+    return candidates
+
+
+# =========================
+# BLOCO 4/5 — MONTAGEM DAS COMBINADAS + MENSAGEM AMIGÁVEL
+# =========================
 def build_combo_high_odds(
     target: float,
     candidates: List[dict],
@@ -390,21 +713,20 @@ def build_combo_high_odds(
     min_legs: int,
 ) -> Tuple[List[dict], float]:
     """
-    ✅ Estratégia: usar as MAIORES odds possíveis para reduzir a chance de precisar adicionar pernas.
-    - fixa um mínimo de pernas (2,3,4,4 para 2/3/4/5)
-    - tenta escolher odds perto de 1.50 (respeitando o alvo)
-    - evita repetir o mesmo jogo dentro do combo
-    - não repete pernas entre combos (used_leg_ids_global)
+    Monta combo priorizando MAIOR odd possível.
+    Regras:
+      - não repetir fixture dentro do combo
+      - não repetir perna entre combos (used_leg_ids_global)
     """
     legs: List[dict] = []
     product = 1.0
-    used_fixture_ids_local = set()
+    used_fixture_ids_local: set[int] = set()
 
     def feasible_if_pick(prod: float, odd: float, remaining_after_pick: int) -> bool:
         max_possible = (prod * odd) * (MAX_ODD ** remaining_after_pick)
         return max_possible >= target * 0.98
 
-    # fase 1: pegar exatamente min_legs, priorizando odds altas
+    # fase 1: garantir min_legs
     for i in range(min_legs):
         remaining_legs = min_legs - i
         desired = (target / max(1e-9, product)) ** (1.0 / remaining_legs)
@@ -427,7 +749,7 @@ def build_combo_high_odds(
             if not feasible_if_pick(product, odd, remaining_after):
                 continue
 
-            # chave: manter próximo do "desired", mas puxando para odds maiores
+            # chave: alta odd primeiro; desempata por maior prob (p)
             key = (abs(odd - desired), -odd, -c["p"])
             if best is None or key < best_key:
                 best = c
@@ -441,8 +763,7 @@ def build_combo_high_odds(
         used_fixture_ids_local.add(best["fixture_id"])
         product *= best["odd_book"]
 
-    # fase 2: se ainda ficou baixo, tenta completar com mais pernas,
-    # mas ainda priorizando odds altas para não virar "combo infinito"
+    # fase 2: completar se necessário
     while product < target * 0.98 and len(legs) < 10:
         remaining = target / max(1e-9, product)
         desired = max(MIN_ODD, min(MAX_ODD, remaining))
@@ -454,7 +775,6 @@ def build_combo_high_odds(
                 continue
             if c["fixture_id"] in used_fixture_ids_local:
                 continue
-
             odd = c["odd_book"]
             if not (MIN_ODD <= odd <= MAX_ODD):
                 continue
@@ -475,6 +795,81 @@ def build_combo_high_odds(
     return legs, product
 
 
+def market_legend(label: str) -> str:
+    """
+    Legenda curta por tipo (baseada no texto do label).
+    """
+    l = label.lower()
+    if "vitória" in l:
+        return "Vitória seca: precisa vencer no tempo normal."
+    if "dupla chance" in l:
+        return "Dupla chance: cobre 2 resultados (ex.: 1X = casa ou empate)."
+    if "ambos marcam" in l:
+        return "Ambos marcam: SIM (os dois fazem gol) / NÃO (apenas um ou nenhum)."
+    if "marca" in l and "ambos" not in l:
+        return "Time marca: time faz pelo menos 1 gol."
+    if "gols" in l:
+        return "Mais/Menos gols: total de gols no jogo (ou do time, quando indicado)."
+    if "escante" in l:
+        return "Mais/Menos escanteios: total do jogo (ou do time, quando indicado)."
+    if "cart" in l:
+        return "Mais/Menos cartões: amarelo+vermelho (total ou do time)."
+    if "chutes a gol" in l:
+        return "Mais/Menos chutes a gol: finalizações no alvo (total ou do time)."
+    return "Mercado conforme descrito."
+
+
+def format_telegram_message(target_date: str, combos: List[Tuple[float, List[dict], float]]) -> str:
+    lines: List[str] = []
+    lines.append(f"📅 *Palpites para {target_date}* (Brasília)")
+    lines.append("Seleção automática com histórico *casa x fora* (até 20 jogos oficiais).")
+    lines.append("")
+
+    any_legs = False
+    used_legends: Dict[str, str] = {}
+
+    for target, legs, prod in combos:
+        title = f"🧩 Combo ~{int(target)}  |  odd estimada ≈ {prod:.2f}"
+        lines.append(title)
+
+        if len(legs) < 2:
+            lines.append("• Sem pernas suficientes dentro dos critérios hoje.")
+            lines.append("")
+            continue
+
+        any_legs = True
+        for leg in legs:
+            # linha bem curta e legível
+            info = f"{leg['home']} x {leg['away']}"
+            when = f"{leg['kickoff']} • {leg['league']}"
+            pick = f"{leg['label']}  (odd≈{leg['odd_book']:.2f})"
+            lines.append(f"• {info}")
+            lines.append(f"  {when}")
+            lines.append(f"  ✅ {pick}")
+
+            # legenda do mercado (sem repetir)
+            key = market_legend(leg["label"])
+            used_legends[key] = key
+
+        lines.append("")
+
+    if not any_legs:
+        lines.append("😕 Hoje não encontrei combinações que respeitem os filtros mínimos.")
+        lines.append("")
+
+    # Legenda final (somente o que foi usado)
+    if used_legends:
+        lines.append("📌 *Legenda dos mercados usados*")
+        for txt in used_legends.values():
+            lines.append(f"• {txt}")
+
+    # Telegram markdown: manter simples (sem HTML)
+    return "\n".join(lines).strip()
+
+
+# =========================
+# BLOCO 5/5 — MAIN (BUSCA JOGOS DE AMANHÃ + GERA CANDIDATOS + ENVIA)
+# =========================
 def main() -> None:
     api_key = os.environ["APISPORTS_KEY"]
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -492,150 +887,68 @@ def main() -> None:
     for d in [utc0.isoformat(), utc1.isoformat(), utc2.isoformat()]:
         fx = api_request("GET", "/fixtures", api_key, params={"date": d, "timezone": "America/Sao_Paulo"})
         for g in fx.get("response", []) or []:
-            fid = int(g["fixture"]["id"])
+            fid = int((g.get("fixture", {}) or {}).get("id"))
             games_map[fid] = g
 
     games_all = list(games_map.values())
 
+    # só amanhã (no fuso BR)
     tomorrow_all = []
     for g in games_all:
-        kickoff = dt.datetime.fromisoformat(g["fixture"]["date"])
+        kickoff_iso = (g.get("fixture", {}) or {}).get("date")
+        if not kickoff_iso:
+            continue
+        kickoff = dt.datetime.fromisoformat(kickoff_iso)
         if kickoff.date().isoformat() == target_date:
             tomorrow_all.append(g)
 
-    tomorrow_all.sort(key=lambda x: x["fixture"]["date"])
+    tomorrow_all.sort(key=lambda x: (x.get("fixture", {}) or {}).get("date", ""))
 
-    # filtros de competição + masculino + profissional
-    tomorrow_filtered = []
-    reasons = {
-        "blocked_league_text": 0,
-        "blocked_team_name": 0,
-        "not_allowed_competition": 0,
-    }
-
+    # filtros de competição + masculino/profissional
+    tomorrow_filtered: List[dict] = []
     for g in tomorrow_all:
         league = g.get("league", {}) or {}
         country = league.get("country", "") or ""
         league_name = league.get("name", "") or ""
 
-        home = (g.get("teams", {}) or {}).get("home", {}) or {}
-        away = (g.get("teams", {}) or {}).get("away", {}) or {}
+        teams = g.get("teams", {}) or {}
+        home = teams.get("home", {}) or {}
+        away = teams.get("away", {}) or {}
         home_name = home.get("name", "") or ""
         away_name = away.get("name", "") or ""
 
         if looks_blocked_text(league_name):
-            reasons["blocked_league_text"] += 1
             continue
-
         if looks_blocked_team(home_name) or looks_blocked_team(away_name):
-            reasons["blocked_team_name"] += 1
             continue
-
         if not is_allowed_competition(country, league_name):
-            reasons["not_allowed_competition"] += 1
             continue
 
         tomorrow_filtered.append(g)
 
-    # cache de times (1 chamada por time)
-    team_cache: Dict[int, Tuple[float, float, int]] = {}
-    team_fail: set[int] = set()
+    # cache de históricos por time/contexto
+    def hist(team_id: int, context: str) -> TeamHistory:
+        return build_team_history(api_key, team_id, context)
 
-    def team_avgs(team_id: int) -> Tuple[float, float, int] | None:
-        if team_id in team_cache:
-            return team_cache[team_id]
-        if team_id in team_fail:
-            return None
-        if API_CALLS >= API_CALL_BUDGET:
-            team_fail.add(team_id)
-            return None
-        try:
-            avg_gf, avg_ga, n = get_last10_team_avgs(api_key, team_id)
-            team_cache[team_id] = (avg_gf, avg_ga, n)
-            return team_cache[team_id]
-        except Exception:
-            team_fail.add(team_id)
-            return None
-
+    # gera candidatos por jogo
     candidates: List[dict] = []
-    processed_games = 0
-    skipped_history = 0
-    skipped_budget = 0
-
-    # gera pernas apenas quando AMBOS têm 10 jogos finalizados
     for g in tomorrow_filtered:
-        fixture_id = int(g["fixture"]["id"])
-        league = g["league"]["name"]
-        country = g["league"].get("country", "") or ""
-        league_id = int(g["league"]["id"])
+        teams = g.get("teams", {}) or {}
+        home_id = int((teams.get("home", {}) or {}).get("id"))
+        away_id = int((teams.get("away", {}) or {}).get("id"))
 
-        home_id = int(g["teams"]["home"]["id"])
-        away_id = int(g["teams"]["away"]["id"])
-        home = g["teams"]["home"]["name"]
-        away = g["teams"]["away"]["name"]
-        kickoff = dt.datetime.fromisoformat(g["fixture"]["date"]).strftime("%H:%M")
+        home_hist = hist(home_id, "home")
+        away_hist = hist(away_id, "away")
 
-        ha = team_avgs(home_id)
-        aa = team_avgs(away_id)
-
-        if ha is None or aa is None:
-            skipped_budget += 1
+        # regra: só descarta jogo se nenhum tiver >=10 (no contexto)
+        if not home_hist.has_min_games() and not away_hist.has_min_games():
             continue
 
-        home_gf, home_ga, home_n = ha
-        away_gf, away_ga, away_n = aa
+        candidates.extend(build_candidates_for_match(g, home_hist, away_hist))
 
-        if home_n < LAST_N or away_n < LAST_N:
-            skipped_history += 1
-            continue
+    # priorizar odds maiores (e um pouco de prob)
+    candidates.sort(key=lambda x: (-x["odd_book"], -x["p"], -x.get("sample_n", 0)))
 
-        lam_home = max(0.2, (home_gf + away_ga) / 2.0)
-        lam_away = max(0.2, (away_gf + home_ga) / 2.0)
-
-        probs = match_probs(lam_home, lam_away)
-
-        # mercados principais (inclui Dupla Chance)
-        markets = [
-            ("OVER_1_5", "Over 1.5 gols", probs["over_1_5"]),
-            ("UNDER_3_5", "Under 3.5 gols", probs["under_3_5"]),
-            ("UNDER_4_5", "Under 4.5 gols", probs["under_4_5"]),
-            ("1X", "Dupla chance 1X", probs["home_win"] + probs["draw"]),
-            ("X2", "Dupla chance X2", probs["away_win"] + probs["draw"]),
-            ("12", "Sem empate (12)", probs["home_win"] + probs["away_win"]),
-            ("HOME_1+", "Casa marca 1+ gol", probs["home_score_1+"]),
-            ("AWAY_1+", "Fora marca 1+ gol", probs["away_score_1+"]),
-        ]
-
-        for code, label, p in markets:
-            p = max(0.0001, float(p))
-            odd_book = odds_with_margin(p)
-            if MIN_ODD <= odd_book <= MAX_ODD:
-                candidates.append({
-                    "fixture_id": fixture_id,
-                    "leg_id": f"{fixture_id}:{code}",
-                    "country": country,
-                    "league": league,
-                    "league_id": league_id,
-                    "kickoff": kickoff,
-                    "home": home,
-                    "away": away,
-                    "label": label,
-                    "p": p,
-                    "odd_book": odd_book,
-                    "lam_home": lam_home,
-                    "lam_away": lam_away,
-                    "home_avg_gf": home_gf,
-                    "home_avg_ga": home_ga,
-                    "away_avg_gf": away_gf,
-                    "away_avg_ga": away_ga,
-                })
-
-        processed_games += 1
-
-    # ordena para favorecer odds mais altas (menos pernas) sem ignorar probabilidade
-    candidates.sort(key=lambda x: (-x["odd_book"], -x["p"]))
-
-    # montar 4 apostas alvo ~2/~3/~4/~5 com mínimo de pernas
     combos_plan = [
         (2.0, 2),
         (3.0, 3),
@@ -644,105 +957,17 @@ def main() -> None:
     ]
 
     used_leg_ids_global: set[str] = set()
-    combos = []
+    combos: List[Tuple[float, List[dict], float]] = []
     for target, min_legs in combos_plan:
         legs, prod = build_combo_high_odds(target, candidates, used_leg_ids_global, min_legs)
         combos.append((target, legs, prod))
 
-    # Telegram (texto): APENAS apostas
-    msg_lines = []
-    msg_lines.append(f"🎯 Apostas — jogos de {target_date} (Brasília)")
-    msg_lines.append("")
+    msg = format_telegram_message(target_date, combos)
 
-    for target, legs, prod in combos:
-        if len(legs) < 2:
-            msg_lines.append(f"❌ Odd ~{int(target)}: sem pernas suficientes.")
-            msg_lines.append("")
-            continue
-
-        msg_lines.append(f"✅ Odd ~{int(target)} (estimada ≈ {prod:.2f}) — {len(legs)} pernas")
-        for i, leg in enumerate(legs, 1):
-            msg_lines.append(
-                f"  {i}) {leg['home']} x {leg['away']} ({leg['league']} {leg['kickoff']})"
-                f" — {leg['label']} | odd≈{leg['odd_book']:.2f}"
-            )
-        msg_lines.append("")
-
-    send_telegram_message(tg_token, tg_chat_id, "\n".join(msg_lines).strip())
-
-    # Relatório completo (arquivo)
-    report = []
-    report.append("Fut Alertas — RELATÓRIO COMPLETO")
-    report.append(f"Data alvo (Brasília): {target_date}")
-    report.append(f"Execução: {now_sp.strftime('%Y-%m-%d %H:%M:%S')} (America/Sao_Paulo)")
-    report.append("")
-    report.append("CONFIG:")
-    report.append(f"- LAST_N: {LAST_N} (últimos 10 jogos finalizados por time)")
-    report.append(f"- HISTORY_LAST_FETCH: {HISTORY_LAST_FETCH}")
-    report.append(f"- Odds (com margem): {MIN_ODD}..{MAX_ODD}")
-    report.append(f"- Margem casa: {BOOK_MARGIN:.2%}")
-    report.append(f"- API calls: {API_CALLS}/{API_CALL_BUDGET}")
-    report.append("")
-    report.append("CONTAGEM:")
-    report.append(f"- Jogos amanhã (total): {len(tomorrow_all)}")
-    report.append(f"- Jogos amanhã (filtrados relevantes): {len(tomorrow_filtered)}")
-    report.append(f"- Processados (com histórico válido): {processed_games}")
-    report.append(f"- Descartados (histórico <10 em algum time): {skipped_history}")
-    report.append(f"- Pulados (budget/erro ao buscar histórico): {skipped_budget}")
-    report.append(f"- Pernas no range ({MIN_ODD}..{MAX_ODD}): {len(candidates)}")
-    report.append("")
-    report.append("FILTROS (descartes por motivo):")
-    for k, v in reasons.items():
-        report.append(f"- {k}: {v}")
-    report.append("")
-
-    report.append("=== JOGOS AMANHÃ (FILTRADOS) ===")
-    for g in tomorrow_filtered:
-        fid = int(g["fixture"]["id"])
-        league = g["league"]["name"]
-        country = g["league"].get("country", "") or ""
-        home = g["teams"]["home"]["name"]
-        away = g["teams"]["away"]["name"]
-        kickoff = dt.datetime.fromisoformat(g["fixture"]["date"]).strftime("%H:%M")
-        report.append(f"- [{fid}] {kickoff} | {country} - {league} | {home} x {away}")
-    report.append("")
-
-    report.append("=== PERNAS (odd no range) ===")
-    for c in candidates:
-        report.append(
-            f"- [{c['fixture_id']}] {c['home']} x {c['away']} | {c['country']} - {c['league']} (league_id={c['league_id']}) {c['kickoff']} | "
-            f"{c['label']} | p={c['p']:.4f} | odd≈{c['odd_book']:.2f} | "
-            f"avgGF/GA casa={c['home_avg_gf']:.2f}/{c['home_avg_ga']:.2f} fora={c['away_avg_gf']:.2f}/{c['away_avg_ga']:.2f} | "
-            f"lambda={c['lam_home']:.2f}-{c['lam_away']:.2f}"
-        )
-    report.append("")
-
-    report.append("=== APOSTAS (COMBINADAS) ===")
-    for target, legs, prod in combos:
-        if len(legs) < 2:
-            report.append(f"- Odd ~{int(target)}: sem pernas suficientes.")
-            continue
-        report.append(f"- Odd ~{int(target)} (estimada ≈ {prod:.2f})")
-        for i, leg in enumerate(legs, 1):
-            report.append(
-                f"  {i}) [{leg['fixture_id']}] {leg['home']} x {leg['away']} ({leg['league']} {leg['kickoff']})"
-                f" — {leg['label']} | odd≈{leg['odd_book']:.2f}"
-            )
-        report.append("")
-
-    report_path = "/tmp/fut_alertas_report.txt"
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(report))
-
-    send_telegram_document(
-        tg_token,
-        tg_chat_id,
-        report_path,
-        caption="📎 Relatório completo (filtros + histórico + pernas + combos + contagens)"
-    )
+    # envia (sem arquivo extra)
+    send_telegram_message(tg_token, tg_chat_id, msg)
 
 
 if __name__ == "__main__":
     main()
     
-
