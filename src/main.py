@@ -178,7 +178,7 @@ ALLOW: Dict[str, set[str]] = {
     },
 }
  
- 
+
 def norm(s: str) -> str:
     s = s or ""
     s = unicodedata.normalize("NFKD", s)
@@ -269,6 +269,8 @@ def api_request(method: str, path: str, api_key: str, params: dict | None = None
  
     raise RuntimeError(f"Falha ao chamar {path} após retries.")
 
+=================================================================================================================================================================================================
+
 def _split_text_for_telegram(text: str, max_len: int) -> List[str]:
     text = text or ""
     if len(text) <= max_len:
@@ -321,6 +323,7 @@ def to_int(v: Any) -> Optional[int]:
         except ValueError:
             return None
     return None
+
 
 def apply_odd_discount(odd_theoretical: Optional[float]) -> Optional[float]:
     """Aplica desconto conservador na odd teórica (ex.: 2.00 -> 1.85 com 7.5%)."""
@@ -520,6 +523,8 @@ def get_fixture_stats(api_key: str, fixture_id: int, dbg: Optional[DebugCollecto
 
     _fixture_stats_cache[fixture_id] = out
     return out
+
+=================================================================================================================================================================================================
 
 @dataclass
 class TeamHistory:
@@ -777,6 +782,8 @@ def weighted_mean(arr: List[int], halflife: float) -> Optional[float]:
     if sw <= 0:
         return None
     return sum(w[i] * float(arr[i]) for i in range(len(arr))) / sw
+
+=================================================================================================================================================================================================
 
 def weighted_beta_rate(arr: List[int], pred_fn, halflife: float) -> Optional[float]:
     """
@@ -1386,13 +1393,11 @@ def build_match_candidates(api_key: str, fx: dict, dbg: Optional[DebugCollector]
 
     return cands
 
-
 def _fmt_hhmm_from_ts(ts: int) -> str:
     try:
         return dt.datetime.fromtimestamp(ts, tz=TZ).strftime("%H:%M")
     except Exception:
         return "--:--"
- 
  
 def format_combo(legs: List[dict], odd_prod: float) -> str:
     out = []
@@ -1402,7 +1407,6 @@ def format_combo(legs: List[dict], odd_prod: float) -> str:
         out.append(f" {_fmt_hhmm_from_ts(c['kickoff_ts'])} • {c['league']}")
         out.append(f" ✅ {c['label']} (odd≈{c['odd_book']:.2f} | n={c.get('samples',0)})")
     return "\n".join(out)
- 
  
 def build_all_candidates_for_day(
     api_key: str, day_fixtures: List[dict], dbg: Optional[DebugCollector] = None
@@ -1420,15 +1424,13 @@ def build_all_candidates_for_day(
         dbg.candidates_by_type = by_type
     return all_cands
  
- 
 def _candidate_sort_key(c: dict) -> Tuple[int, float, float]:
-    # prioridade: mais amostras -> menor odd -> maior p
+    # prioridade: mais amostras -> maior p -> menor odd
     return (
         int(c.get("samples", 0)),
-        -float(c.get("odd_book", 0.0)),
         float(c.get("p", 0.0)),
+        -float(c.get("odd_book", 0.0)),
     )
- 
  
 def _best_combo_from_single_fixture(
     fixture_cands: List[dict],
@@ -1439,11 +1441,22 @@ def _best_combo_from_single_fixture(
     fixture_state: dict,
 ) -> Optional[Tuple[List[dict], float]]:
     """Tenta montar um combo apenas com legs do MESMO jogo (preferência), garantindo coerência interna via constraints."""
-    cand = [c for c in fixture_cands if c["leg_id"] not in banned_leg_ids]
+    cand = [
+        c
+        for c in fixture_cands
+        if c["leg_id"] not in banned_leg_ids and str(c.get("type") or "") != "outros"
+    ]
     if not cand:
         return None
  
-    # ordena por (amostras, menor odd, p)
+    # limita pernas ao número de mercados (types) disponíveis (exclui "outros")
+    type_set = set(str(c.get("type") or "") for c in cand)
+    type_set.discard("outros")
+    max_legs = min(int(max_legs), len(type_set))
+    if max_legs <= 0 or max_legs < int(min_legs):
+        return None
+ 
+    # ordena por (amostras, p, menor odd)
     cand.sort(key=_candidate_sort_key, reverse=True)
  
     best: Optional[Tuple[List[dict], float, float]] = None  # (legs, prod, score)
@@ -1451,9 +1464,9 @@ def _best_combo_from_single_fixture(
  
     # busca limitada (beam/dfs pequeno) para não explodir
     # avalia todos os tamanhos de pernas permitidos e escolhe o mais próximo do target
-    for L in range(max(3, min_legs), max_legs + 1):
+    for L in range(max(1, int(min_legs)), int(max_legs) + 1):
         # beam
-        beam: List[Tuple[List[dict], float, dict]] = [
+        beam: List[Tuple[List[dict], float, dict, Set[str]]] = [
             (
                 [],
                 1.0,
@@ -1462,14 +1475,23 @@ def _best_combo_from_single_fixture(
                     "bounds": {k: [v[0], v[1]] for k, v in fixture_state["bounds"].items()},
                     "btts": fixture_state["btts"],
                 },
+                set(),
             )
         ]
+ 
         for _ in range(L):
-            new_beam: List[Tuple[List[dict], float, dict]] = []
-            for legs, prod, st in beam:
+            new_beam: List[Tuple[List[dict], float, dict, Set[str]]] = []
+            for legs, prod, st, used_types in beam:
                 for c in cand:
                     if c in legs:
                         continue
+                    ctype = str(c.get("type") or "")
+                    if ctype == "outros":
+                        continue
+                    # regra: no máximo 1 perna por mercado (type) dentro do combo/jogo
+                    if ctype in used_types:
+                        continue
+ 
                     # coerência incremental
                     st2 = {
                         "allowed_results": set(st["allowed_results"]),
@@ -1478,22 +1500,27 @@ def _best_combo_from_single_fixture(
                     }
                     if not _constraints_apply(st2, c.get("meta") or {}):
                         continue
+ 
+                    used2 = set(used_types)
+                    used2.add(ctype)
+ 
                     prod2 = prod * float(c["odd_book"])
-                    new_beam.append((legs + [c], prod2, st2))
+                    new_beam.append((legs + [c], prod2, st2, used2))
+ 
             if not new_beam:
                 beam = []
                 break
  
             # mantém top-N por proximidade do target; em empate, prefere passar do target
             def beam_score(item):
-                legs, prod, _st = item
+                legs, prod, _st, _types = item
                 diff = math.log(max(0.0001, prod)) - log_target
                 return (abs(diff), -len(legs), -diff, -prod)
  
             new_beam.sort(key=beam_score)
             beam = new_beam[:40]
  
-        for legs, prod, st in beam:
+        for legs, prod, st, used_types in beam:
             if len(legs) != L:
                 continue
             # score final: proximidade do target + penaliza pernas
@@ -1506,7 +1533,6 @@ def _best_combo_from_single_fixture(
         return (best[0], best[1])
     return None
  
- 
 def greedy_select_legs_for_target(
     all_cands: List[dict],
     target_odd: float,
@@ -1514,20 +1540,41 @@ def greedy_select_legs_for_target(
     max_legs: int = 10,
     banned_leg_ids: Optional[Set[str]] = None,
 ) -> Tuple[List[dict], float]:
-    """Fallback (mix de jogos): tenta aproximar target_odd respeitando:
-    - perna única
-    - coerência por fixture quando repetir fixture dentro do combo
+    """
+    Fallback: tenta aproximar target_odd respeitando:
+      - perna única
+      - coerência por fixture
+      - 1 perna por mercado (type)
+      - (ajuste) mantém apenas um único jogo no combo
     """
     banned_leg_ids = banned_leg_ids or set()
-    cands = [c for c in all_cands if c["leg_id"] not in banned_leg_ids]
+    cands = [
+        c
+        for c in all_cands
+        if c["leg_id"] not in banned_leg_ids and str(c.get("type") or "") != "outros"
+    ]
     cands.sort(key=_candidate_sort_key, reverse=True)
  
     legs: List[dict] = []
     prod = 1.0
     per_fixture_state: Dict[int, dict] = {}
+    used_types: Set[str] = set()
+    fixed_fid: Optional[int] = None
  
     def can_add(c: dict) -> bool:
+        nonlocal fixed_fid
         fid = int(c["fixture_id"])
+        if fixed_fid is None:
+            fixed_fid = fid
+        if fid != fixed_fid:
+            return False
+ 
+        ctype = str(c.get("type") or "")
+        if ctype == "outros":
+            return False
+        if ctype in used_types:
+            return False
+ 
         st = per_fixture_state.get(fid)
         if st is None:
             st = _fresh_constraint_state()
@@ -1538,12 +1585,16 @@ def greedy_select_legs_for_target(
         }
         if not _constraints_apply(st2, c.get("meta") or {}):
             return False
+ 
         # ok
         per_fixture_state[fid] = st2
+        used_types.add(ctype)
         return True
  
     if seed_leg is not None:
         if seed_leg["leg_id"] in banned_leg_ids:
+            return [], 1.0
+        if str(seed_leg.get("type") or "") == "outros":
             return [], 1.0
         if not can_add(seed_leg):
             return [], 1.0
@@ -1563,6 +1614,13 @@ def greedy_select_legs_for_target(
         for c in cands:
             if c in legs:
                 continue
+            if str(c.get("type") or "") == "outros":
+                continue
+            if fixed_fid is not None and int(c["fixture_id"]) != fixed_fid:
+                continue
+            if str(c.get("type") or "") in used_types:
+                continue
+ 
             # teste coerência sem mutar estado
             fid = int(c["fixture_id"])
             st = per_fixture_state.get(fid) or _fresh_constraint_state()
@@ -1578,7 +1636,6 @@ def greedy_select_legs_for_target(
             diff2 = math.log(max(0.0001, prod2)) - log_target
             score = abs(diff2) + (0.04 * (len(legs) + 1)) + (1e-6 if diff2 < 0 else 0.0)  # empate: prefere passar de 3
  
-            # preferir mais amostras já vem do sort; aqui só escolhe melhor aproximação
             if best_score is None or score < best_score:
                 best, best_score = c, score
  
@@ -1609,38 +1666,90 @@ def build_target_combos(
 ) -> List[Tuple[List[dict], float]]:
     """
     Gera até N combos (~target_odd) garantindo:
-      ✅ cada perna usada 1 vez (global)
-      ✅ coerência por jogo quando o mesmo fixture aparece mais de uma vez
-      ✅ preferência: combo com um único jogo (quando possível)
+    ✅ cada perna usada 1 vez (global)
+    ✅ 1 combo = 1 jogo (fixture) e 1 jogo só aparece em 1 combo
+    ✅ no máximo 1 perna por mercado (market = type), ignorando type="outros"
+    ✅ ranking de jogos: mais mercados distintos (types) -> maior média de samples -> mais próximo da odd alvo
     """
     if not all_cands or n_combos <= 0:
         return []
  
-    # ordenação global (mais amostras -> menor odd -> maior p)
+    # ordenação global (mais amostras -> maior p -> menor odd) (mantida para seed/apoio)
     cands = sorted(all_cands, key=_candidate_sort_key, reverse=True)
  
-    # agrupa por fixture para tentar "1 aposta = 1 jogo"
+    # agrupa por fixture (1 aposta = 1 jogo)
     by_fixture: Dict[int, List[dict]] = {}
     for c in cands:
         by_fixture.setdefault(int(c["fixture_id"]), []).append(c)
  
-    # fixtures ordenados pelo melhor candidato (mais amostras, menor odd)
-    fixture_order = sorted(
-        by_fixture.keys(),
-        key=lambda fid: _candidate_sort_key(by_fixture[fid][0]),
-        reverse=True,
-    )
+    log_target = math.log(max(0.0001, target_odd))
+ 
+    def _fixture_rank_key(fid: int) -> Tuple[int, float, float, int]:
+        """
+        Ranking por jogo:
+          1) mais mercados distintos (types) válidos (exclui "outros")
+          2) maior média de samples por mercado (type)
+          3) mais próximo da odd alvo (via melhor combo possível no jogo)
+             (empate: prefere passar do alvo)
+        """
+        fx_cands = [x for x in (by_fixture.get(fid) or []) if str(x.get("type") or "") != "outros"]
+        if not fx_cands:
+            # joga para o final
+            return (0, 0.0, float("inf"), 1)
+ 
+        # mercados distintos (type)
+        types = set(str(x.get("type") or "") for x in fx_cands)
+        types.discard("outros")
+        n_types = len(types)
+ 
+        # média de samples por mercado (type) (usa o maior samples disponível por type)
+        if n_types > 0:
+            per_type_best_samples = []
+            for t in types:
+                per_type_best_samples.append(
+                    max(int(x.get("samples", 0)) for x in fx_cands if str(x.get("type") or "") == t)
+                )
+            avg_samples = float(sum(per_type_best_samples)) / float(len(per_type_best_samples))
+        else:
+            avg_samples = 0.0
+ 
+        # melhor combo do jogo (para critério de proximidade do alvo)
+        # (usa estado "fresh" e sem legs banidas, pois legs são únicas por fixture)
+        base_state = _fresh_constraint_state()
+        best = _best_combo_from_single_fixture(
+            fixture_cands=by_fixture.get(fid) or [],
+            target_odd=target_odd,
+            min_legs=min_legs,
+            max_legs=max_legs,
+            banned_leg_ids=set(),
+            fixture_state=base_state,
+        )
+ 
+        if best is None:
+            # sem combo válido dentro das regras -> joga para o final (mantendo n_types/avg_samples)
+            return (n_types, avg_samples, float("inf"), 1)
+ 
+        _legs, prod = best
+        diff = math.log(max(0.0001, prod)) - log_target
+        abs_diff = abs(diff)
+        pass_pref = 0 if diff >= 0 else 1  # empate: prefere passar do alvo
+        return (n_types, avg_samples, abs_diff, pass_pref)
+ 
+    # fixtures ordenados pelo ranking de jogos (mais mercados -> média samples -> proximidade do alvo)
+    fixture_order = sorted(by_fixture.keys(), key=_fixture_rank_key, reverse=True)
  
     out: List[Tuple[List[dict], float]] = []
     used_global: Set[str] = set()
     fixture_used_as_primary: Set[int] = set()
-    fixture_states_global: Dict[int, dict] = {}  # coerência entre apostas se repetir fixture
+    fixture_states_global: Dict[int, dict] = {}  # mantido por compatibilidade
  
-    # Passo 1: tenta montar combos por fixture (preferência)
+    # Passo 1: monta 1 combo por fixture seguindo o ranking
     for fid in fixture_order:
         if len(out) >= n_combos:
             break
-        if fid in fixture_used_as_primary and PREFER_SINGLE_FIXTURE_PER_COMBO:
+ 
+        # um jogo só pode aparecer em um combo
+        if fid in fixture_used_as_primary:
             continue
  
         base_state = fixture_states_global.get(fid) or _fresh_constraint_state()
@@ -1654,6 +1763,7 @@ def build_target_combos(
         )
         if best is None:
             continue
+ 
         legs, prod = best
  
         # valida e atualiza estados globais
@@ -1663,13 +1773,29 @@ def build_target_combos(
             "btts": base_state["btts"],
         }
         ok = True
+        used_types_local: Set[str] = set()
+ 
         for l in legs:
             if l["leg_id"] in used_global:
                 ok = False
                 break
+ 
+            # regra: não permitir type "outros" no combo
+            if str(l.get("type") or "") == "outros":
+                ok = False
+                break
+ 
+            # regra: no máximo 1 perna por type no combo/jogo
+            t = str(l.get("type") or "")
+            if t in used_types_local:
+                ok = False
+                break
+            used_types_local.add(t)
+ 
             if not _constraints_apply(st, l.get("meta") or {}):
                 ok = False
                 break
+ 
         if not ok:
             continue
  
@@ -1678,63 +1804,76 @@ def build_target_combos(
         fixture_states_global[fid] = st
         fixture_used_as_primary.add(fid)
  
-    # Passo 2: se faltou, mistura jogos (fallback) mantendo perna única e coerência por fixture
-    # (não inventa nada — só usa o que existir)
-    while len(out) < n_combos:
-        # seed: pega o melhor que ainda não foi usado
-        seed = None
-        for c in cands[: max(10, seed_pool)]:
-            if c["leg_id"] not in used_global:
-                seed = c
+    # Passo 2: fallback (ainda 1 jogo por combo): tenta montar combos por fixture via greedy,
+    # respeitando as mesmas regras (1 perna por type, sem "outros")
+    if len(out) < n_combos:
+        for fid in fixture_order:
+            if len(out) >= n_combos:
                 break
+            if fid in fixture_used_as_primary:
+                continue
  
-        legs, prod = greedy_select_legs_for_target(
-            all_cands=cands,
-            target_odd=target_odd,
-            seed_leg=seed,
-            max_legs=max_legs,
-            banned_leg_ids=used_global,
-        )
-        if not legs:
-            break
+            fx_cands = by_fixture.get(fid) or []
+            if not fx_cands:
+                continue
  
-        # valida coerência global para fixtures repetidos
-        ok = True
-        local_by_fixture: Dict[int, dict] = {}
-        for l in legs:
-            fid = int(l["fixture_id"])
+            # seed: melhor candidato disponível do próprio jogo
+            seed = None
+            for c in sorted(fx_cands, key=_candidate_sort_key, reverse=True)[: max(10, seed_pool)]:
+                if c["leg_id"] not in used_global and str(c.get("type") or "") != "outros":
+                    seed = c
+                    break
+ 
+            legs, prod = greedy_select_legs_for_target(
+                all_cands=fx_cands,
+                target_odd=target_odd,
+                seed_leg=seed,
+                max_legs=max_legs,
+                banned_leg_ids=used_global,
+            )
+            if not legs:
+                continue
+ 
+            # valida e registra (1 fixture)
             st_base = fixture_states_global.get(fid) or _fresh_constraint_state()
             st = {
                 "allowed_results": set(st_base["allowed_results"]),
                 "bounds": {k: [v[0], v[1]] for k, v in st_base["bounds"].items()},
                 "btts": st_base["btts"],
             }
-            # aplica legs desse combo pro mesmo fixture
-            for x in [z for z in legs if int(z["fixture_id"]) == fid]:
-                if not _constraints_apply(st, x.get("meta") or {}):
+ 
+            ok = True
+            used_types_local: Set[str] = set()
+            for l in legs:
+                if l["leg_id"] in used_global:
                     ok = False
                     break
+                if int(l["fixture_id"]) != int(fid):
+                    ok = False
+                    break
+                if str(l.get("type") or "") == "outros":
+                    ok = False
+                    break
+                t = str(l.get("type") or "")
+                if t in used_types_local:
+                    ok = False
+                    break
+                used_types_local.add(t)
+                if not _constraints_apply(st, l.get("meta") or {}):
+                    ok = False
+                    break
+ 
             if not ok:
-                break
-            local_by_fixture[fid] = st
+                continue
  
-        if not ok:
-            # evita loop infinito: marca seed como usado "virtualmente" e tenta outra
-            if seed is not None:
-                used_global.add(seed["leg_id"])
-            continue
- 
-        out.append((legs, prod))
-        used_global.update(l["leg_id"] for l in legs)
- 
-        # atualiza estados globais
-        for fid, st in local_by_fixture.items():
+            out.append((legs, prod))
+            used_global.update(l["leg_id"] for l in legs)
             fixture_states_global[fid] = st
+            fixture_used_as_primary.add(fid)
  
     if dbg:
         dbg.inc(dbg.counts, f"target_combos_generated_{len(out)}")
     return out
- 
  
 # =========================
 # BLOCO 6/6 — MAIN + DEBUG OUTPUT
@@ -1748,29 +1887,24 @@ def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugColle
             dbg.inc(dbg.counts, "budget_exceeded_on_day_fixtures")
             dbg.add_api_error(f"[BUDGET] /fixtures(date) date={target_date} err={e}")
         return []
- 
     debug_check_api_payload(data, "/fixtures(date)", params, dbg)
     fx = data.get("response", []) or []
     now_sp = dt.datetime.now(TZ)
- 
     out: List[dict] = []
     for m in fx:
         fixture = m.get("fixture") or {}
         ts = to_int(fixture.get("timestamp")) or 0
         dtt = dt.datetime.fromtimestamp(ts, tz=TZ) if ts else None
- 
         # só jogos que ainda não começaram (evita apostas em andamento)
         if not dtt or dtt <= now_sp:
             if dbg:
                 dbg.inc(dbg.filter_reasons, "day_skip_not_future")
             continue
- 
         league = m.get("league") or {}
         if not is_allowed_competition(str(league.get("country") or ""), str(league.get("name") or "")):
             if dbg:
                 dbg.inc(dbg.filter_reasons, "day_skip_league_not_allowed")
             continue
- 
         teams = m.get("teams") or {}
         home = teams.get("home") or {}
         away = teams.get("away") or {}
@@ -1778,10 +1912,9 @@ def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugColle
             if dbg:
                 dbg.inc(dbg.filter_reasons, "day_skip_blocked_team")
             continue
- 
         out.append(m)
     return out
-
+ 
 def build_picks_message(target_date: str, combos: List[Tuple[List[dict], float]]) -> str:
     out: List[str] = []
     out.append(f"📅 Palpites para {target_date} (Brasília)")
@@ -1792,18 +1925,15 @@ def build_picks_message(target_date: str, combos: List[Tuple[List[dict], float]]
         f"Odds por perna (já com desconto {ODD_DISCOUNT*100:.1f}% na odd teórica): {MIN_ODD:.2f}–{MAX_ODD:.2f} | "
         f"Objetivo combo: ~{TARGET_COMBO_ODD:.2f} | "
         f"Combos gerados: {len(combos)}\n"
-        "Regras: perna única (sem repetição no portfólio) + coerência global (sem contradições no mesmo jogo).\n"
+        "Regras: 1 combo = 1 jogo (sem repetição de jogo no portfólio) + 1 perna por mercado (type) por jogo (sem 'outros') + coerência (sem contradições no mesmo jogo).\n"
     )
-
     if not combos:
         out.append("⚠️ Hoje não foi possível montar combos dentro dos critérios (sem inventar dados).")
         out.append("Sugestão: verifique ligas permitidas, range de odds, P_MIN e disponibilidade de stats na API.")
         return "\n".join(out).strip()
-
     for legs, prod in combos:
         out.append(format_combo(legs, prod))
         out.append("")
-
     out.append("📌 Legenda / interpretação (linhas inteiras)")
     out.append("• Vitória simples: mandante vence / visitante vence (1X2 sem empate como seleção).")
     out.append("• Chance dupla: 1X / X2 / 12.")
