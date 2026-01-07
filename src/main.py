@@ -47,6 +47,7 @@ BLOCK_LEAGUE_WORDS = [
     "youth", "junior", "reserve", "reserves",
     "friendly", "friendlies", "amistoso", "amistosos", "treino", "test",
     "development", "academy",
+    "serie c", "serie d",
 ]
 BLOCK_TEAM_PATTERNS = [
     r"\b(u(1[5-9]|2[0-3]))\b",
@@ -82,7 +83,9 @@ ALLOW: Dict[str, set[str]] = {
     "argentina": {"liga profesional argentina", "primera division", "copa argentina"},
     "mexico": {"liga mx"},
     "usa": {"major league soccer", "mls", "us open cup"},
-    "brazil": {"serie a", "serie b", "serie c", "copa do brasil", "copa do nordeste", "supercopa do brasil"},
+
+    "brazil": {"serie a", "serie b", "copa do brasil", "copa do nordeste", "supercopa do brasil"},
+
     "world": {
         "uefa champions league", "uefa europa league", "uefa europa conference league",
         "uefa super cup", "copa libertadores", "copa sudamericana", "recopa sudamericana",
@@ -128,7 +131,7 @@ def is_allowed_competition(country: str, league_name: str) -> bool:
     if key in ALLOW:
         if nl in ALLOW[key]:
             return True
-        return any(a in nl for a in ALLOW[key])
+        return False
     return False
 
 
@@ -277,9 +280,6 @@ def debug_check_api_payload(d: dict, path: str, params: dict, dbg: Optional[Debu
     if isinstance(res, int) and res == 0:
         dbg.inc(dbg.counts, "api_payload_results_0")
 
-
-
-
 # =========================
 # BLOCO 3/6 — FIXTURES + STATS (com budget de stats e cache)
 # =========================
@@ -390,145 +390,160 @@ class TeamHistory:
     def mean(self, arr: List[int]) -> Optional[float]:
         return (sum(arr) / len(arr)) if arr else None
 
-
-
-
 # =========================
-# BLOCO 4/6 — BUILD HISTORY (stats só até atingir amostras mínimas)
+# BLOCO 4/6 — BUILD HISTORY (stats opcionais, usa cache e respeita filtros)
 # =========================
+def _fixture_final_score(fx: dict) -> Tuple[Optional[int], Optional[int]]:
+    g = fx.get("goals") or {}
+    gh = to_int(g.get("home"))
+    ga = to_int(g.get("away"))
+    return gh, ga
+
+def _fixture_status_short(fx: dict) -> str:
+    st = (((fx.get("fixture") or {}).get("status") or {}).get("short")) or ""
+    return str(st)
+
+def _fixture_league_ok(fx: dict) -> bool:
+    league = fx.get("league") or {}
+    name = str(league.get("name") or "")
+    country = str(league.get("country") or "")
+    return is_allowed_competition(country, name)
+
+def _fixture_teams_ok(fx: dict, team_id: int, context: str) -> bool:
+    teams = fx.get("teams") or {}
+    h = teams.get("home") or {}
+    a = teams.get("away") or {}
+    hid = to_int(h.get("id"))
+    aid = to_int(a.get("id"))
+
+    if context == "home":
+        if hid != team_id:
+            return False
+        if looks_blocked_team(str(a.get("name") or "")):
+            return False
+    else:
+        if aid != team_id:
+            return False
+        if looks_blocked_team(str(h.get("name") or "")):
+            return False
+    if looks_blocked_team(str(h.get("name") or "")):
+        return False
+    if looks_blocked_team(str(a.get("name") or "")):
+        return False
+    return True
+
 def build_team_history(api_key: str, team_id: int, context: str, dbg: Optional[DebugCollector] = None) -> TeamHistory:
     key = (team_id, context)
     if key in _team_history_cache:
+        if dbg:
+            dbg.inc(dbg.hist_summary, "hist_cache_hit")
         return _team_history_cache[key]
 
+    fx = get_team_fixtures(api_key, team_id, dbg=dbg)
     hist = TeamHistory(team_id=team_id, context=context)
-    fx = get_team_fixtures(api_key, team_id, dbg)
 
-    scanned = 0
-    skipped_status = skipped_league = skipped_team = skipped_context = skipped_goals = 0
-    stats_calls_skipped_enough = 0
-    stats_calls_skipped_budget = 0
+    for m in fx:
+        st = _fixture_status_short(m)
+        if st not in FINISHED_STATUSES:
+            if dbg:
+                dbg.inc(dbg.filter_reasons, f"hist_skip_status_{st or 'NA'}")
+            continue
 
-    for f in fx:
-        scanned += 1
+        if not _fixture_league_ok(m):
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "hist_skip_league_not_allowed")
+            continue
+
+        if not _fixture_teams_ok(m, team_id, context):
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "hist_skip_team_blocked_or_context_mismatch")
+            continue
+
         if hist.n_games >= HIST_MAX_GAMES:
             break
 
-        fixture = f.get("fixture", {}) or {}
-        status = ((fixture.get("status", {}) or {}).get("short") or "").strip()
-        if status not in FINISHED_STATUSES:
-            skipped_status += 1
+        fixture = m.get("fixture") or {}
+        fid = to_int(fixture.get("id"))
+        if fid is None:
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "hist_skip_no_fixture_id")
             continue
 
-        league = f.get("league", {}) or {}
-        league_name = league.get("name", "") or ""
-        if looks_blocked_text(league_name):
-            skipped_league += 1
+        teams = m.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+        hid = to_int(home.get("id"))
+        aid = to_int(away.get("id"))
+        if hid is None or aid is None:
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "hist_skip_no_team_id")
             continue
 
-        teams = f.get("teams", {}) or {}
-        home = teams.get("home", {}) or {}
-        away = teams.get("away", {}) or {}
-        home_id = to_int(home.get("id"))
-        away_id = to_int(away.get("id"))
-        if home_id is None or away_id is None:
-            skipped_team += 1
-            continue
-        if looks_blocked_team(home.get("name", "") or "") or looks_blocked_team(away.get("name", "") or ""):
-            skipped_team += 1
-            continue
-
-        is_home = int(home_id) == int(team_id)
-        is_away = int(away_id) == int(team_id)
-        if context == "home" and not is_home:
-            skipped_context += 1
-            continue
-        if context == "away" and not is_away:
-            skipped_context += 1
-            continue
-
-        goals = f.get("goals", {}) or {}
-        gh = to_int(goals.get("home"))
-        ga = to_int(goals.get("away"))
+        gh, ga = _fixture_final_score(m)
         if gh is None or ga is None:
-            skipped_goals += 1
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "hist_skip_missing_goals")
             continue
 
-        if is_home:
-            gf, ga_ = int(gh), int(ga)
-            opp_id = int(away_id)
+        if context == "home":
+            gf = gh
+            ga_ = ga
+            opp_id = aid
         else:
-            gf, ga_ = int(ga), int(gh)
-            opp_id = int(home_id)
+            gf = ga
+            ga_ = gh
+            opp_id = hid
 
-        hist.gf.append(gf)
-        hist.ga.append(ga_)
+        hist.gf.append(int(gf))
+        hist.ga.append(int(ga_))
+        hist.fixture_ids.append(int(fid))
         hist.n_games += 1
 
-        fixture_id = to_int(fixture.get("id"))
-        if fixture_id is None:
-            continue
-        hist.fixture_ids.append(int(fixture_id))
+        # stats opcionais (corners/sog/cards) se o budget permitir
+        stats = get_fixture_stats(api_key, int(fid), dbg=dbg)
+        if stats:
+            me = stats.get(int(team_id)) or {}
+            opp = stats.get(int(opp_id)) or {}
 
-        # ===== stats (corners/cards/sog) =====
-        # só chama stats enquanto ainda precisa atingir >=10 amostras por categoria
-        needs_corners = len(hist.corners_for) < HIST_MIN_GAMES
-        needs_cards = len(hist.cards_for) < HIST_MIN_GAMES
-        needs_sog = len(hist.sog_for) < HIST_MIN_GAMES
-        if not (needs_corners or needs_cards or needs_sog):
-            stats_calls_skipped_enough += 1
-            continue
+            c_for = me.get("corners")
+            c_against = opp.get("corners")
+            if c_for is not None and c_against is not None:
+                hist.corners_for.append(int(c_for))
+                hist.corners_against.append(int(c_against))
+            else:
+                if dbg:
+                    dbg.inc(dbg.stats_missing, "corners_missing")
 
-        if STATS_DISABLED_GLOBAL:
-            stats_calls_skipped_budget += 1
-            continue
+            sog_for = me.get("sog")
+            sog_against = opp.get("sog")
+            if sog_for is not None and sog_against is not None:
+                hist.sog_for.append(int(sog_for))
+                hist.sog_against.append(int(sog_against))
+            else:
+                if dbg:
+                    dbg.inc(dbg.stats_missing, "sog_missing")
 
-        st = get_fixture_stats(api_key, int(fixture_id), dbg)
-        if not st:
-            stats_calls_skipped_budget += 1
-            continue
-
-        me = st.get(int(team_id), {})
-        opp = st.get(int(opp_id), {})
-
-        c_me, c_opp = to_int(me.get("corners")), to_int(opp.get("corners"))
-        if c_me is not None and c_opp is not None:
-            hist.corners_for.append(int(c_me))
-            hist.corners_against.append(int(c_opp))
-        elif dbg:
-            dbg.inc(dbg.stats_missing, "corners_missing")
-
-        s_me, s_opp = to_int(me.get("sog")), to_int(opp.get("sog"))
-        if s_me is not None and s_opp is not None:
-            hist.sog_for.append(int(s_me))
-            hist.sog_against.append(int(s_opp))
-        elif dbg:
-            dbg.inc(dbg.stats_missing, "sog_missing")
-
-        y_me, r_me = to_int(me.get("yellow")), to_int(me.get("red"))
-        y_opp, r_opp = to_int(opp.get("yellow")), to_int(opp.get("red"))
-        if y_me is not None and r_me is not None and y_opp is not None and r_opp is not None:
-            hist.cards_for.append(int(y_me + r_me))
-            hist.cards_against.append(int(y_opp + r_opp))
-        elif dbg:
-            dbg.inc(dbg.stats_missing, "cards_missing")
+            y_for = me.get("yellow")
+            y_against = opp.get("yellow")
+            r_for = me.get("red")
+            r_against = opp.get("red")
+            if y_for is not None and y_against is not None:
+                hist.cards_for.append(int(y_for) + int(r_for or 0))
+                hist.cards_against.append(int(y_against) + int(r_against or 0))
+            else:
+                if dbg:
+                    dbg.inc(dbg.stats_missing, "cards_missing")
+        else:
+            if dbg:
+                dbg.inc(dbg.stats_missing, "stats_unavailable_or_budget")
 
     if dbg:
-        dbg.add_match_detail(
-            f"[HIST] team={team_id} ctx={context} usados={hist.n_games}/{HIST_MAX_GAMES} (min={HIST_MIN_GAMES}) "
-            f"corners_ok={len(hist.corners_for)} cards_ok={len(hist.cards_for)} sog_ok={len(hist.sog_for)} "
-            f"scanned={scanned} skip_status={skipped_status} skip_league={skipped_league} "
-            f"skip_team={skipped_team} skip_ctx={skipped_context} skip_goals={skipped_goals} "
-            f"skip_stats_enough={stats_calls_skipped_enough} skip_stats_budget={stats_calls_skipped_budget}"
-        )
         dbg.inc(dbg.hist_summary, "hist_built")
-        if hist.has_min_games():
-            dbg.inc(dbg.hist_summary, f"hist_ok_{context}")
+        if not hist.has_min_games():
+            dbg.inc(dbg.hist_summary, "hist_below_min_games")
 
     _team_history_cache[key] = hist
     return hist
-
-
 
 
 # =========================
@@ -536,496 +551,511 @@ def build_team_history(api_key: str, team_id: int, context: str, dbg: Optional[D
 # =========================
 def odds_with_margin(p: float) -> float:
     p = max(0.0001, min(0.9999, float(p)))
-    p_adj = min(0.9999, p * (1.0 + BOOK_MARGIN))
+    p_adj = p * (1.0 - BOOK_MARGIN)
+    p_adj = max(0.0001, min(0.9999, p_adj))
     return 1.0 / p_adj
 
-def poisson_probs(lam: float, max_k: int = 10) -> List[float]:
-    lam = max(0.2, float(lam))
-    p0 = math.exp(-lam)
-    probs = [p0]
-    for k in range(1, max_k + 1):
-        probs.append(probs[-1] * lam / k)
-    s = sum(probs)
-    return [p / s for p in probs]
-
-def match_probs(lh: float, la: float, max_g: int = 10) -> Dict[str, float]:
-    ph = poisson_probs(lh, max_g)
-    pa = poisson_probs(la, max_g)
-
-    p_home_win = p_draw = p_away_win = 0.0
-    p_total_leq = {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
-
-    for i in range(max_g + 1):
-        for j in range(max_g + 1):
-            p = ph[i] * pa[j]
-            if i > j:
-                p_home_win += p
-            elif i == j:
-                p_draw += p
-            else:
-                p_away_win += p
-            s = i + j
-            for k in p_total_leq:
-                if s <= k:
-                    p_total_leq[k] += p
-
-    return {
-        "home_win": p_home_win,
-        "draw": p_draw,
-        "away_win": p_away_win,
-        "over_1_5": 1.0 - p_total_leq[1],
-        "over_2_5": 1.0 - p_total_leq[2],
-        "under_3_5": p_total_leq[3],
-        "under_4_5": p_total_leq[4],
-        "home_score_1+": 1.0 - ph[0],
-        "away_score_1+": 1.0 - pa[0],
-    }
-
-def expected_goals_from_hist(home_h: TeamHistory, away_h: TeamHistory) -> Tuple[Optional[float], Optional[float]]:
-    if not home_h.has_min_games() and not away_h.has_min_games():
-        return None, None
-    home_attack = home_h.mean(home_h.gf) if home_h.has_min_games() else None
-    home_def = home_h.mean(home_h.ga) if home_h.has_min_games() else None
-    away_attack = away_h.mean(away_h.gf) if away_h.has_min_games() else None
-    away_def = away_h.mean(away_h.ga) if away_h.has_min_games() else None
-    parts_h = [x for x in [home_attack, away_def] if x is not None]
-    parts_a = [x for x in [away_attack, home_def] if x is not None]
-    eh = (sum(parts_h) / len(parts_h)) if parts_h else None
-    ea = (sum(parts_a) / len(parts_a)) if parts_a else None
-    if eh is not None: eh = max(0.2, float(eh))
-    if ea is not None: ea = max(0.2, float(ea))
-    return eh, ea
-
-def safe_add_candidate(
-    candidates: List[dict],
-    fixture_id: int,
-    leg_code: str,
-    label: str,
-    p: Optional[float],
-    sample_n: int,
-    meta: dict,
-    dbg: Optional[DebugCollector] = None,
-) -> None:
+def clamp_prob(p: Optional[float]) -> Optional[float]:
     if p is None:
+        return None
+    return max(0.0, min(1.0, float(p)))
+
+def mean(arr: List[int]) -> Optional[float]:
+    return (sum(arr) / len(arr)) if arr else None
+
+def rate_at_least_1(arr: List[int]) -> Optional[float]:
+    if not arr:
+        return None
+    return sum(1 for x in arr if x >= 1) / len(arr)
+
+def rate_under(arr: List[int], thr: float) -> Optional[float]:
+    if not arr:
+        return None
+    return sum(1 for x in arr if x < thr) / len(arr)
+
+def rate_over(arr: List[int], thr: float) -> Optional[float]:
+    if not arr:
+        return None
+    return sum(1 for x in arr if x > thr) / len(arr)
+
+def btts_rate(gf_a: List[int], gf_b: List[int]) -> Optional[float]:
+    if not gf_a or not gf_b:
+        return None
+    n = min(len(gf_a), len(gf_b))
+    if n == 0:
+        return None
+    ok = 0
+    for i in range(n):
+        if gf_a[i] >= 1 and gf_b[i] >= 1:
+            ok += 1
+    return ok / n
+
+def compute_market_probs(home_hist: TeamHistory, away_hist: TeamHistory) -> Dict[str, Optional[float]]:
+    """
+    Calcula probabilidades simples para alguns mercados usando histórico HOME/AWAY.
+    """
+    probs: Dict[str, Optional[float]] = {}
+
+    # Time marca (>=1)
+    probs["home_scores"] = clamp_prob(rate_at_least_1(home_hist.gf))
+    probs["away_scores"] = clamp_prob(rate_at_least_1(away_hist.gf))
+
+    # Ambos marcam
+    probs["btts_yes"] = clamp_prob(btts_rate(home_hist.gf, away_hist.gf))
+    probs["btts_no"] = (1.0 - probs["btts_yes"]) if probs["btts_yes"] is not None else None
+
+    # Gols do jogo (proxy: soma médias)
+    mu_goals = None
+    m_h = mean(home_hist.gf)
+    m_a = mean(away_hist.gf)
+    if m_h is not None and m_a is not None:
+        mu_goals = m_h + m_a
+
+    # P(>1.5) e P(<3.5) via aproximação Poisson simples
+    if mu_goals is not None:
+        lam = max(0.01, mu_goals)
+        # P(X<=1) = e^-lam (1 + lam)
+        p_le_1 = math.exp(-lam) * (1.0 + lam)
+        p_gt_1_5 = 1.0 - p_le_1
+        probs["over_1_5_goals"] = clamp_prob(p_gt_1_5)
+
+        # P(X<=3) = e^-lam * sum_{k=0..3} lam^k/k!
+        p_le_3 = math.exp(-lam) * (1.0 + lam + lam**2 / 2.0 + lam**3 / 6.0)
+        probs["under_3_5_goals"] = clamp_prob(p_le_3)
+
+    # Escanteios (se disponível)
+    tot_corners = []
+    n = min(len(home_hist.corners_for), len(away_hist.corners_for))
+    if n > 0:
+        for i in range(n):
+            tot_corners.append(home_hist.corners_for[i] + away_hist.corners_for[i])
+
+    probs["under_10_5_corners"] = clamp_prob(rate_under(tot_corners, 10.5))
+    probs["over_7_5_corners"] = clamp_prob(rate_over(tot_corners, 7.5))
+
+    # Chutes a gol (se disponível)
+    tot_sog = []
+    n2 = min(len(home_hist.sog_for), len(away_hist.sog_for))
+    if n2 > 0:
+        for i in range(n2):
+            tot_sog.append(home_hist.sog_for[i] + away_hist.sog_for[i])
+
+    probs["under_7_5_sog"] = clamp_prob(rate_under(tot_sog, 7.5))
+
+    # Visitante: under 3.5 SOG (usa sog_for do away)
+    probs["away_under_3_5_sog"] = clamp_prob(rate_under(away_hist.sog_for, 3.5))
+    # Mandante: over 3.5 SOG (usa sog_for do home)
+    probs["home_over_3_5_sog"] = clamp_prob(rate_over(home_hist.sog_for, 3.5))
+
+    return probs
+
+def candidate_markets_from_probs(probs: Dict[str, Optional[float]]) -> List[dict]:
+    """
+    Monta lista de candidatos com label, prob (p), odd_book (odd com margem) e tipo.
+    """
+    candidates: List[dict] = []
+
+    def add(label: str, key: str):
+        p = probs.get(key)
+        if p is None:
+            return
+        odd_book = odds_with_margin(p)
+        candidates.append({
+            "label": label,
+            "key": key,
+            "p": float(p),
+            "odd_book": float(odd_book),
+            "type": pick_label_type(label),
+        })
+
+    add("Mandante marca (>=1)", "home_scores")
+    add("Visitante marca (>=1)", "away_scores")
+
+    add("Ambos marcam — SIM", "btts_yes")
+    add("Ambos marcam — NÃO", "btts_no")
+
+    add("Mais de 1.5 gols (jogo)", "over_1_5_goals")
+    add("Menos de 3.5 gols (jogo)", "under_3_5_goals")
+
+    add("Menos de 10.5 escanteios (jogo)", "under_10_5_corners")
+    add("Mais de 7.5 escanteios (jogo)", "over_7_5_corners")
+
+    add("Menos de 7.5 chutes a gol (jogo)", "under_7_5_sog")
+    add("Visitante: Menos de 3.5 chutes a gol", "away_under_3_5_sog")
+    add("Mandante: Mais de 3.5 chutes a gol", "home_over_3_5_sog")
+
+    return candidates
+
+def filter_candidates(cands: List[dict], dbg: Optional[DebugCollector] = None) -> List[dict]:
+    out = []
+    for c in cands:
+        odd = c["odd_book"]
+        if odd < MIN_ODD or odd > MAX_ODD:
+            if dbg:
+                dbg.inc(dbg.candidate_reject_reasons, "odd_out_of_range")
+                dbg.add_reject_sample(f"[ODD] {c['label']} odd={odd:.2f}")
+            continue
+        # evita picks sem confiança mínima
+        if c["p"] < 0.55:
+            if dbg:
+                dbg.inc(dbg.candidate_reject_reasons, "p_too_low")
+                dbg.add_reject_sample(f"[P] {c['label']} p={c['p']:.3f}")
+            continue
+        out.append(c)
+    return out
+
+def build_match_candidates(api_key: str, fx: dict, dbg: Optional[DebugCollector] = None) -> List[dict]:
+    """
+    Para um fixture do dia, monta candidatos usando histórico HOME/AWAY.
+    """
+    fixture = fx.get("fixture") or {}
+    teams = fx.get("teams") or {}
+    league = fx.get("league") or {}
+
+    fid = to_int(fixture.get("id"))
+    home = teams.get("home") or {}
+    away = teams.get("away") or {}
+    hid = to_int(home.get("id"))
+    aid = to_int(away.get("id"))
+
+    if fid is None or hid is None or aid is None:
         if dbg:
-            dbg.inc(dbg.candidate_reject_reasons, "p_none")
-            dbg.add_reject_sample(f"[REJ] {fixture_id} {leg_code} {label} | p=None")
-        return
-    if sample_n < HIST_MIN_GAMES:
-        if dbg:
-            dbg.inc(dbg.candidate_reject_reasons, "sample_lt_min")
-            dbg.add_reject_sample(f"[REJ] {fixture_id} {leg_code} {label} | sample={sample_n} < {HIST_MIN_GAMES}")
-        return
-    odd = odds_with_margin(p)
-    if odd < MIN_ODD:
-        if dbg:
-            dbg.inc(dbg.candidate_reject_reasons, "odd_lt_min")
-            dbg.add_reject_sample(f"[REJ] {fixture_id} {leg_code} {label} | p={p:.3f} odd={odd:.2f} < {MIN_ODD}")
-        return
-    if odd > MAX_ODD:
-        if dbg:
-            dbg.inc(dbg.candidate_reject_reasons, "odd_gt_max")
-            dbg.add_reject_sample(f"[REJ] {fixture_id} {leg_code} {label} | p={p:.3f} odd={odd:.2f} > {MAX_ODD}")
-        return
-    row = {"fixture_id": fixture_id, "leg_id": f"{fixture_id}:{leg_code}", "label": label,
-           "p": float(p), "odd_book": float(odd), "sample_n": int(sample_n), **meta}
-    candidates.append(row)
-    if dbg:
-        dbg.candidates_total += 1
-        dbg.inc(dbg.candidates_by_type, pick_label_type(label))
-
-def build_candidates_for_match(
-    fixture: dict,
-    home_hist: TeamHistory,
-    away_hist: TeamHistory,
-    dbg: Optional[DebugCollector] = None,
-) -> List[dict]:
-    fixture_id = int((fixture.get("fixture", {}) or {}).get("id"))
-    league = (fixture.get("league", {}) or {}).get("name", "") or ""
-    kickoff_iso = (fixture.get("fixture", {}) or {}).get("date") or ""
-    kickoff = dt.datetime.fromisoformat(kickoff_iso).strftime("%H:%M") if kickoff_iso else "??:??"
-    home = ((fixture.get("teams", {}) or {}).get("home", {}) or {}).get("name", "") or ""
-    away = ((fixture.get("teams", {}) or {}).get("away", {}) or {}).get("name", "") or ""
-    meta = {"league": league, "kickoff": kickoff, "home": home, "away": away}
-
-    cands: List[dict] = []
-    home_ok, away_ok = home_hist.has_min_games(), away_hist.has_min_games()
-    eh, ea = expected_goals_from_hist(home_hist, away_hist)
-
-    if dbg:
-        dbg.add_match_detail(
-            f"[MATCH] {home} x {away} ({league}) {kickoff} home_ok={home_ok} away_ok={away_ok} "
-            f"n_home={home_hist.n_games} n_away={away_hist.n_games} eh={eh} ea={ea} "
-            f"corners_samples=({len(home_hist.corners_for)},{len(away_hist.corners_for)}) "
-            f"cards_samples=({len(home_hist.cards_for)},{len(away_hist.cards_for)}) "
-            f"sog_samples=({len(home_hist.sog_for)},{len(away_hist.sog_for)})"
-        )
-
-    # 1) Vitória / Dupla chance / Gols / BTTS / Time marca
-    if home_ok and away_ok and eh is not None and ea is not None:
-        probs = match_probs(eh, ea)
-        n_pair = min(home_hist.n_games, away_hist.n_games)
-
-        safe_add_candidate(cands, fixture_id, "1", "Vitória do mandante (1)", probs["home_win"], n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "2", "Vitória do visitante (2)", probs["away_win"], n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "1X", "Dupla chance (1X)", probs["home_win"] + probs["draw"], n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "X2", "Dupla chance (X2)", probs["away_win"] + probs["draw"], n_pair, meta, dbg)
-
-        safe_add_candidate(cands, fixture_id, "G_O15", "Mais de 1.5 gols (jogo)", probs["over_1_5"], n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "G_U35", "Menos de 3.5 gols (jogo)", probs["under_3_5"], n_pair, meta, dbg)
-
-        p_h, p_a = probs["home_score_1+"], probs["away_score_1+"]
-        safe_add_candidate(cands, fixture_id, "H_1+", "Mandante marca (>=1)", p_h, n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "A_1+", "Visitante marca (>=1)", p_a, n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "BTTS_Y", "Ambos marcam — SIM", p_h * p_a, n_pair, meta, dbg)
-        safe_add_candidate(cands, fixture_id, "BTTS_N", "Ambos marcam — NÃO", 1.0 - (p_h * p_a), n_pair, meta, dbg)
-    else:
-        # modo SOLO (quando só um lado tem base >=10)
-        if home_ok and eh is not None:
-            p = 1.0 - poisson_probs(eh, 10)[0]
-            safe_add_candidate(cands, fixture_id, "H_1+_SOLO", "Mandante marca (>=1)", p, home_hist.n_games, meta, dbg)
-        if away_ok and ea is not None:
-            p = 1.0 - poisson_probs(ea, 10)[0]
-            safe_add_candidate(cands, fixture_id, "A_1+_SOLO", "Visitante marca (>=1)", p, away_hist.n_games, meta, dbg)
-
-    # 2) Corners / Cards / SOG — total e por time (se um lado tiver 10+, usa só ele)
-    CORNERS_TOTAL_LINES = [7.5, 8.5, 9.5, 10.5]
-    CARDS_TOTAL_LINES = [2.5, 3.5, 4.5, 5.5]
-    SOG_TOTAL_LINES = [6.5, 7.5, 8.5, 9.5]
-    TEAM_LINES = {"corners": [3.5, 4.5, 5.5], "cards": [1.5, 2.5, 3.5], "sog": [2.5, 3.5, 4.5]}
-
-    def total_series(h: TeamHistory, kind: str) -> List[int]:
-        if kind == "corners": return [a + b for a, b in zip(h.corners_for, h.corners_against)]
-        if kind == "cards": return [a + b for a, b in zip(h.cards_for, h.cards_against)]
-        if kind == "sog": return [a + b for a, b in zip(h.sog_for, h.sog_against)]
+            dbg.inc(dbg.filter_reasons, "day_skip_missing_ids")
         return []
 
-    def add_total_market(kind: str, line: float, over: bool) -> None:
-        hs, as_ = total_series(home_hist, kind), total_series(away_hist, kind)
-        use = None
-        if len(hs) >= HIST_MIN_GAMES and len(as_) >= HIST_MIN_GAMES:
-            ph = (sum(1 for x in hs if x > line) / len(hs)) if over else (sum(1 for x in hs if x < line) / len(hs))
-            pa = (sum(1 for x in as_ if x > line) / len(as_)) if over else (sum(1 for x in as_ if x < line) / len(as_))
-            use = ((ph + pa) / 2.0, min(len(hs), len(as_)))
-        elif len(hs) >= HIST_MIN_GAMES:
-            p = (sum(1 for x in hs if x > line) / len(hs)) if over else (sum(1 for x in hs if x < line) / len(hs))
-            use = (p, len(hs))
-        elif len(as_) >= HIST_MIN_GAMES:
-            p = (sum(1 for x in as_ if x > line) / len(as_)) if over else (sum(1 for x in as_ if x < line) / len(as_))
-            use = (p, len(as_))
-        else:
-            if dbg: dbg.inc(dbg.candidate_reject_reasons, f"{kind}_total_samples_lt_min")
-            return
+    home_hist = build_team_history(api_key, int(hid), "home", dbg=dbg)
+    away_hist = build_team_history(api_key, int(aid), "away", dbg=dbg)
 
-        p, n = use
-        unit = "escanteios" if kind == "corners" else "cartões" if kind == "cards" else "chutes a gol"
-        code = f"{kind.upper()}_{'O' if over else 'U'}_{str(line).replace('.','')}"
-        label = f"{'Mais' if over else 'Menos'} de {line} {unit} (jogo)"
-        safe_add_candidate(cands, fixture_id, code, label, p, n, meta, dbg)
+    if not home_hist.has_min_games() or not away_hist.has_min_games():
+        if dbg:
+            dbg.inc(dbg.filter_reasons, "day_skip_hist_below_min")
+        return []
 
-    def add_team_market(side: str, kind: str, line: float, over: bool) -> None:
-        h = home_hist if side == "home" else away_hist
-        arr = h.corners_for if kind == "corners" else h.cards_for if kind == "cards" else h.sog_for
-        if len(arr) < HIST_MIN_GAMES:
-            if dbg: dbg.inc(dbg.candidate_reject_reasons, f"{kind}_team_samples_lt_min")
-            return
-        p = (sum(1 for x in arr if x > line) / len(arr)) if over else (sum(1 for x in arr if x < line) / len(arr))
-        unit = "escanteios" if kind == "corners" else "cartões" if kind == "cards" else "chutes a gol"
-        who = "Mandante" if side == "home" else "Visitante"
-        code = f"{side[0].upper()}{kind.upper()}_{'O' if over else 'U'}_{str(line).replace('.','')}"
-        label = f"{who}: {'Mais' if over else 'Menos'} de {line} {unit}"
-        safe_add_candidate(cands, fixture_id, code, label, p, len(arr), meta, dbg)
+    probs = compute_market_probs(home_hist, away_hist)
+    cands = candidate_markets_from_probs(probs)
+    cands = filter_candidates(cands, dbg=dbg)
 
-    for ln in CORNERS_TOTAL_LINES:
-        add_total_market("corners", ln, True); add_total_market("corners", ln, False)
-    for ln in CARDS_TOTAL_LINES:
-        add_total_market("cards", ln, True); add_total_market("cards", ln, False)
-    for ln in SOG_TOTAL_LINES:
-        add_total_market("sog", ln, True); add_total_market("sog", ln, False)
+    # metadata do jogo
+    kickoff = to_int(fixture.get("timestamp")) or 0
+    ctry = str(league.get("country") or "")
+    lname = str(league.get("name") or "")
+    hname = str(home.get("name") or "")
+    aname = str(away.get("name") or "")
 
-    for kind, lines in TEAM_LINES.items():
-        for ln in lines:
-            add_team_market("home", kind, ln, True); add_team_market("home", kind, ln, False)
-            add_team_market("away", kind, ln, True); add_team_market("away", kind, ln, False)
+    for c in cands:
+        c["fixture_id"] = int(fid)
+        c["kickoff_ts"] = int(kickoff)
+        c["country"] = ctry
+        c["league"] = lname
+        c["home"] = hname
+        c["away"] = aname
+        c["leg_id"] = f"{fid}:{c['key']}"
 
     return cands
 
-def build_combo_high_odds(target: float, candidates: List[dict], used_leg_ids: set, min_legs: int) -> Tuple[List[dict], float]:
+def _fmt_hhmm_from_ts(ts: int) -> str:
+    try:
+        return dt.datetime.fromtimestamp(ts, tz=TZ).strftime("%H:%M")
+    except Exception:
+        return "--:--"
+
+def select_best_legs_for_combo(
+    all_cands: List[dict],
+    size: int,
+    dbg: Optional[DebugCollector] = None
+) -> Tuple[List[dict], float]:
+    """
+    Seleciona legs evitando:
+      - repetir o mesmo fixture
+      - repetir o mesmo mercado (type) no combo
+    Heurística: maior p primeiro; desempate por odd (mais alta dentro do range)
+    Retorna (legs, odd_prod)
+    """
+    if not all_cands:
+        return [], 1.0
+
+    # ordena por p desc, odd desc
+    cands = sorted(all_cands, key=lambda x: (x["p"], x["odd_book"]), reverse=True)
+
     legs: List[dict] = []
+    used_fixture_ids = set()
+    used_types = set()
+    used_leg_ids = set()
     prod = 1.0
-    used_fixture_ids: set[int] = set()
 
-    def feasible(prod_now: float, odd: float, remaining: int) -> bool:
-        return (prod_now * odd) * (MAX_ODD ** remaining) >= target * 0.98
+    for _ in range(size):
+        best = None
+        best_key = None
+        for c in cands:
+            if c["fixture_id"] in used_fixture_ids:
+                continue
+            if c["type"] in used_types:
+                continue
+            if c["leg_id"] in used_leg_ids:
+                continue
 
-    for i in range(min_legs):
-        remaining = min_legs - i
-        desired = (target / max(1e-9, prod)) ** (1.0 / remaining)
-        desired = max(MIN_ODD, min(MAX_ODD, desired))
-        best, best_key = None, None
-        for c in candidates:
-            if c["leg_id"] in used_leg_ids: continue
-            if c["fixture_id"] in used_fixture_ids: continue
-            odd = c["odd_book"]
-            if not (MIN_ODD <= odd <= MAX_ODD): continue
-            if not feasible(prod, odd, remaining - 1): continue
-            key = (abs(odd - desired), -odd, -c["p"])
-            if best is None or key < best_key:
+            # score simples
+            key = (c["p"], c["odd_book"])
+            if best is None or key > best_key:
                 best, best_key = c, key
-        if not best: break
-        legs.append(best); used_leg_ids.add(best["leg_id"]); used_fixture_ids.add(best["fixture_id"]); prod *= best["odd_book"]
 
-    while prod < target * 0.98 and len(legs) < 10:
-        desired = max(MIN_ODD, min(MAX_ODD, target / max(1e-9, prod)))
-        best, best_key = None, None
-        for c in candidates:
-            if c["leg_id"] in used_leg_ids: continue
-            if c["fixture_id"] in used_fixture_ids: continue
-            odd = c["odd_book"]
-            if not (MIN_ODD <= odd <= MAX_ODD): continue
-            key = (abs(odd - desired), -odd, -c["p"])
-            if best is None or key < best_key:
+        if not best:
+            break
+
+        legs.append(best)
+        used_fixture_ids.add(best["fixture_id"])
+        used_types.add(best["type"])
+        used_leg_ids.add(best["leg_id"])
+        prod *= best["odd_book"]
+
+    if dbg:
+        if len(legs) < size:
+            dbg.inc(dbg.counts, f"combo_size_{size}_incomplete")
+        else:
+            dbg.inc(dbg.counts, f"combo_size_{size}_ok")
+
+    return legs, prod
+
+def format_combo(legs: List[dict], odd_prod: float) -> str:
+    out = []
+    out.append(f"🧩 Combo ~{len(legs)}  |  odd estimada ≈ {odd_prod:.2f}")
+    for c in legs:
+        out.append(f"• {c['home']} x {c['away']}")
+        out.append(f"  {_fmt_hhmm_from_ts(c['kickoff_ts'])} • {c['league']}")
+        out.append(f"  ✅ {c['label']}  (odd≈{c['odd_book']:.2f})")
+    return "\n".join(out)
+
+def build_combos_for_day(
+    all_cands: List[dict],
+    dbg: Optional[DebugCollector] = None
+) -> List[Tuple[List[dict], float]]:
+    combos: List[Tuple[List[dict], float]] = []
+    for size in (2, 3, 4, 5):
+        legs, prod = select_best_legs_for_combo(all_cands, size=size, dbg=dbg)
+        if len(legs) >= 2:
+            combos.append((legs, prod))
+    return combos
+
+def build_all_candidates_for_day(api_key: str, day_fixtures: List[dict], dbg: Optional[DebugCollector] = None) -> List[dict]:
+    all_cands: List[dict] = []
+    for fx in day_fixtures:
+        c = build_match_candidates(api_key, fx, dbg=dbg)
+        if c:
+            all_cands.extend(c)
+
+    if dbg:
+        dbg.candidates_total = len(all_cands)
+        by_type: Dict[str, int] = {}
+        for c in all_cands:
+            by_type[c["type"]] = by_type.get(c["type"], 0) + 1
+        dbg.candidates_by_type = by_type
+    return all_cands
+
+def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugCollector] = None) -> List[dict]:
+    params = {"date": target_date, "timezone": "America/Sao_Paulo"}
+    try:
+        data = api_request("GET", "/fixtures", api_key, params=params)
+    except ApiBudgetExceeded as e:
+        if dbg:
+            dbg.inc(dbg.counts, "budget_exceeded_on_day_fixtures")
+            dbg.add_api_error(f"[BUDGET] /fixtures(date) date={target_date} err={e}")
+        return []
+
+    debug_check_api_payload(data, "/fixtures(date)", params, dbg)
+    fx = data.get("response", []) or []
+
+    # filtra somente jogos futuros (no fuso) e campeonatos permitidos
+    now_sp = dt.datetime.now(TZ)
+    out = []
+    for m in fx:
+        fixture = m.get("fixture") or {}
+        ts = to_int(fixture.get("timestamp")) or 0
+        dtt = dt.datetime.fromtimestamp(ts, tz=TZ) if ts else None
+        if not dtt or dtt <= now_sp:
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "day_skip_not_future")
+            continue
+
+        league = m.get("league") or {}
+        if not is_allowed_competition(str(league.get("country") or ""), str(league.get("name") or "")):
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "day_skip_league_not_allowed")
+            continue
+
+        teams = m.get("teams") or {}
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+        if looks_blocked_team(str(home.get("name") or "")) or looks_blocked_team(str(away.get("name") or "")):
+            if dbg:
+                dbg.inc(dbg.filter_reasons, "day_skip_blocked_team")
+            continue
+
+        out.append(m)
+
+    return out
+
+def build_picks_message(target_date: str, combos: List[Tuple[List[dict], float]]) -> str:
+    out = []
+    out.append(f"📅 Palpites para {target_date} (Brasília)")
+    out.append("Critérios: casa x fora (até 20 oficiais), min 10 amostras por mercado.\n")
+    for legs, prod in combos:
+        out.append(format_combo(legs, prod))
+        out.append("")
+    out.append("📌 Legenda dos mercados usados")
+    out.append("• Time marca: time faz pelo menos 1 gol.")
+    out.append("• Mais/Menos escanteios: total do jogo (ou do time, quando indicado).")
+    out.append("• Mais/Menos chutes a gol: finalizações no alvo (total ou do time).")
+    out.append("• Mais/Menos gols: total de gols no jogo (ou do time, quando indicado).")
+    out.append("• Ambos marcam: SIM (os dois fazem gol) / NÃO (apenas um ou nenhum).")
+    return "\n".join(out).strip()
+
+def greedy_select_legs_for_target(
+    all_cands: List[dict],
+    target_odd: float,
+    dbg: Optional[DebugCollector] = None
+) -> Tuple[List[dict], float]:
+    """
+    Seleciona legs tentando chegar perto de um target de odd.
+    Evita repetir fixture e evita repetir type.
+    """
+    if not all_cands:
+        return [], 1.0
+
+    cands = sorted(all_cands, key=lambda x: (x["p"], x["odd_book"]), reverse=True)
+
+    legs: List[dict] = []
+    used_leg_ids = set()
+    used_types = set()
+    used_fixture_ids = set()
+    prod = 1.0
+
+    while prod < target_odd:
+        best = None
+        best_key = None
+        for c in cands:
+            if c["leg_id"] in used_leg_ids:
+                continue
+            if c["type"] in used_types:
+                continue
+            if c["fixture_id"] in used_fixture_ids:
+                continue
+
+            new_prod = prod * c["odd_book"]
+            # score: aproxima target sem passar muito + p alto
+            score = -abs(target_odd - new_prod) + (c["p"] * 0.15)
+            key = (score, c["p"], c["odd_book"])
+            if best is None or key > best_key:
                 best, best_key = c, key
-        if not best: break
-        legs.append(best); used_leg_ids.add(best["leg_id"]); used_fixture_ids.add(best["fixture_id"]); prod *= best["odd_book"]
+
+        if not best:
+            break
+
+        legs.append(best)
+        used_leg_ids.add(best["leg_id"])
+        used_fixture_ids.add(best["fixture_id"])
+        prod *= best["odd_book"]
 
     return legs, prod
 
 
-
-
 # =========================
-# BLOCO 6/6 — MENSAGEM + DEBUG TXT + MAIN (sempre envia TXT)
+# BLOCO 6/6 — MAIN + DEBUG OUTPUT
 # =========================
-def market_legend(label: str) -> str:
-    l = label.lower()
-    if "vitória" in l: return "Vitória seca: precisa vencer no tempo normal."
-    if "dupla chance" in l: return "Dupla chance: cobre 2 resultados (ex.: 1X = casa ou empate)."
-    if "ambos marcam" in l: return "Ambos marcam: SIM (os dois fazem gol) / NÃO (apenas um ou nenhum)."
-    if "marca" in l and "ambos" not in l: return "Time marca: time faz pelo menos 1 gol."
-    if "gols" in l: return "Mais/Menos gols: total de gols no jogo (ou do time, quando indicado)."
-    if "escante" in l: return "Mais/Menos escanteios: total do jogo (ou do time, quando indicado)."
-    if "cart" in l: return "Mais/Menos cartões: amarelo+vermelho (total ou do time)."
-    if "chutes a gol" in l: return "Mais/Menos chutes a gol: finalizações no alvo (total ou do time)."
-    return "Mercado conforme descrito."
+def build_debug_report(dbg: DebugCollector) -> str:
+    out = []
+    out.append("==== DEBUG REPORT ====")
+    out.append(f"run_started_sp: {dbg.run_started_sp}")
+    out.append(f"target_date: {dbg.target_date}")
+    out.append(f"api_calls_budget: {dbg.api_calls_budget}")
+    out.append(f"api_calls_used: {dbg.api_calls_used}")
+    out.append(f"stats_calls_budget: {dbg.stats_calls_budget}")
+    out.append(f"stats_calls_used: {dbg.stats_calls_used}")
+    out.append("")
 
-def format_telegram_message(target_date: str, combos: List[Tuple[float, List[dict], float]]) -> str:
-    lines: List[str] = []
-    lines.append(f"📅 Palpites para {target_date} (Brasília)")
-    lines.append("Critérios: casa x fora (até 20 oficiais), min 10 amostras por mercado.")
-    lines.append("")
-    used_legends: Dict[str, str] = {}
-    any_legs = False
+    def dump_counter(title: str, d: Dict[str, int]):
+        if not d:
+            return
+        out.append(f"-- {title} --")
+        for k, v in sorted(d.items(), key=lambda x: (-x[1], x[0])):
+            out.append(f"{k}: {v}")
+        out.append("")
 
-    for target, legs, prod in combos:
-        lines.append(f"🧩 Combo ~{int(target)}  |  odd estimada ≈ {prod:.2f}")
-        if len(legs) < 2:
-            lines.append("• Sem pernas suficientes dentro dos critérios hoje.\n")
-            continue
-        any_legs = True
-        for leg in legs:
-            lines.append(f"• {leg['home']} x {leg['away']}")
-            lines.append(f"  {leg['kickoff']} • {leg['league']}")
-            lines.append(f"  ✅ {leg['label']}  (odd≈{leg['odd_book']:.2f})")
-            used_legends[market_legend(leg["label"])] = market_legend(leg["label"])
-        lines.append("")
-
-    if not any_legs:
-        lines.append("😕 Hoje não encontrei combinações que respeitem os filtros mínimos.\n")
-
-    if used_legends:
-        lines.append("📌 Legenda dos mercados usados")
-        for txt in used_legends.values():
-            lines.append(f"• {txt}")
-    return "\n".join(lines).strip()
-
-def build_debug_report(dbg: DebugCollector, combos: List[Tuple[float, List[dict], float]], candidates: List[dict]) -> str:
-    lines: List[str] = []
-    lines.append("===== DEBUG REPORT (APOSTAS) =====")
-    lines.append(f"Run (SP): {dbg.run_started_sp}")
-    lines.append(f"Target date (SP): {dbg.target_date}\n")
-    lines.append("---- Config ----")
-    lines.append(f"MIN_ODD={MIN_ODD} MAX_ODD={MAX_ODD} BOOK_MARGIN={BOOK_MARGIN}")
-    lines.append(f"HIST_MAX_GAMES={HIST_MAX_GAMES} HIST_MIN_GAMES={HIST_MIN_GAMES}")
-    lines.append(f"HISTORY_LAST_FETCH_RAW={HISTORY_LAST_FETCH_RAW} HISTORY_LAST_FETCH_CAPPED={HISTORY_LAST_FETCH}")
-    lines.append(f"API_CALL_BUDGET={dbg.api_calls_budget} API_CALLS_USED={dbg.api_calls_used}")
-    lines.append(f"STATS_CALL_BUDGET={dbg.stats_calls_budget} STATS_CALLS_USED={dbg.stats_calls_used}")
-    lines.append(f"STATS_DISABLED_GLOBAL={STATS_DISABLED_GLOBAL}\n")
-
-    lines.append("---- Contagens do pipeline ----")
-    for k in sorted(dbg.counts.keys()):
-        lines.append(f"{k}: {dbg.counts[k]}")
-    lines.append("")
-
-    if dbg.filter_reasons:
-        lines.append("---- Motivos de filtro (jogos) ----")
-        for k in sorted(dbg.filter_reasons.keys()):
-            lines.append(f"{k}: {dbg.filter_reasons[k]}")
-        lines.append("")
-
-    lines.append("---- Histórico (resumo) ----")
-    for k in sorted(dbg.hist_summary.keys()):
-        lines.append(f"{k}: {dbg.hist_summary[k]}")
-    lines.append("")
-
-    if dbg.stats_missing:
-        lines.append("---- Stats ausentes em fixtures (contagem) ----")
-        for k in sorted(dbg.stats_missing.keys()):
-            lines.append(f"{k}: {dbg.stats_missing[k]}")
-        lines.append("")
-
-    lines.append("---- Candidatos ----")
-    lines.append(f"candidates_total_aceitos: {dbg.candidates_total}")
-    for k in sorted(dbg.candidates_by_type.keys()):
-        lines.append(f"  by_type.{k}: {dbg.candidates_by_type[k]}")
-    lines.append("")
-
-    if dbg.candidate_reject_reasons:
-        lines.append("---- Rejeições (motivos) ----")
-        for k in sorted(dbg.candidate_reject_reasons.keys()):
-            lines.append(f"{k}: {dbg.candidate_reject_reasons[k]}")
-        lines.append("")
+    dump_counter("counts", dbg.counts)
+    dump_counter("filter_reasons", dbg.filter_reasons)
+    dump_counter("hist_summary", dbg.hist_summary)
+    dump_counter("stats_missing", dbg.stats_missing)
+    dump_counter("candidates_by_type", dbg.candidates_by_type)
+    dump_counter("candidate_reject_reasons", dbg.candidate_reject_reasons)
 
     if dbg.candidate_reject_samples:
-        lines.append("---- Exemplos de rejeição (amostra) ----")
-        lines.extend(dbg.candidate_reject_samples)
-        lines.append("")
-
-    if dbg.api_error_samples:
-        lines.append("---- API payload errors / budget (amostra) ----")
-        lines.extend(dbg.api_error_samples)
-        lines.append("")
-
-    if dbg.empty_team_fixtures_samples:
-        lines.append("---- Times sem fixtures retornados (amostra) ----")
-        lines.extend(dbg.empty_team_fixtures_samples)
-        lines.append("")
-
-    lines.append("---- Combos montados ----")
-    for target, legs, prod in combos:
-        lines.append(f"Combo ~{int(target)} | prod={prod:.2f} | legs={len(legs)}")
-        for leg in legs:
-            lines.append(f"  - {leg['home']} x {leg['away']} | {leg['kickoff']} {leg['league']} | "
-                         f"{leg['label']} | odd={leg['odd_book']:.2f} p={leg['p']:.3f} n={leg['sample_n']}")
-    lines.append("")
+        out.append("-- candidate_reject_samples --")
+        out.extend(dbg.candidate_reject_samples)
+        out.append("")
 
     if dbg.match_details:
-        lines.append("---- Detalhes por partida/histórico (limitado) ----")
-        lines.extend(dbg.match_details)
-        lines.append("")
+        out.append("-- match_details --")
+        out.extend(dbg.match_details)
+        out.append("")
 
-    lines.append("---- Snapshot: Top 25 candidatos por odd ----")
-    top = sorted(candidates, key=lambda x: (-x["odd_book"], -x["p"]))[:25]
-    for c in top:
-        lines.append(f"{c['odd_book']:.2f} | p={c['p']:.3f} n={c['sample_n']} | "
-                     f"{c['home']} x {c['away']} | {c['label']} | {c['league']}")
-    return "\n".join(lines).strip()
+    if dbg.api_error_samples:
+        out.append("-- api_error_samples --")
+        out.extend(dbg.api_error_samples)
+        out.append("")
+
+    if dbg.empty_team_fixtures_samples:
+        out.append("-- empty_team_fixtures_samples --")
+        out.extend(dbg.empty_team_fixtures_samples)
+        out.append("")
+
+    return "\n".join(out).strip()
 
 def main() -> None:
-    global STATS_CALLS
-    api_key = os.environ["APISPORTS_KEY"]
-    tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
-    tg_chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    api_key = os.getenv("API_FOOTBALL_KEY") or ""
+    tg_token = os.getenv("TG_BOT_TOKEN") or ""
+    tg_chat_id = os.getenv("TG_CHAT_ID") or ""
+    if not api_key or not tg_token or not tg_chat_id:
+        raise SystemExit("Faltam envs: API_FOOTBALL_KEY, TG_BOT_TOKEN, TG_CHAT_ID")
+
+    now_sp = dt.datetime.now(TZ)
+    t_date = (now_sp + dt.timedelta(days=1)).date().isoformat()
+    target_date = os.getenv("TARGET_DATE") or t_date
 
     dbg = DebugCollector()
-    dbg.run_started_sp = dt.datetime.now(TZ).isoformat(timespec="seconds")
+    dbg.run_started_sp = now_sp.isoformat()
+    dbg.target_date = target_date
     dbg.api_calls_budget = API_CALL_BUDGET
     dbg.stats_calls_budget = STATS_CALL_BUDGET
 
-    now_sp = dt.datetime.now(TZ)
-    target_date = (now_sp.date() + dt.timedelta(days=1)).isoformat()
-    dbg.target_date = target_date
+    # Seleciona fixtures do dia alvo
+    day_fx = select_day_fixtures(api_key, target_date, dbg=dbg)
+    # Limita para evitar explosão de histórico
+    day_fx = day_fx[:20]
 
-    # carrega jogos (3 datas UTC para cobrir fuso)
-    utc0 = dt.datetime.utcnow().date()
-    utc_dates = [utc0, utc0 + dt.timedelta(days=1), utc0 + dt.timedelta(days=2)]
-    games_map: Dict[int, dict] = {}
+    # Constrói candidatos e combos
+    all_cands = build_all_candidates_for_day(api_key, day_fx, dbg=dbg)
+    combos = build_combos_for_day(all_cands, dbg=dbg)
 
-    for d in utc_dates:
-        params = {"date": d.isoformat(), "timezone": "America/Sao_Paulo"}
+    msg = build_picks_message(target_date, combos)
+
+    # Envia mensagem principal
+    try:
+        send_telegram_message(tg_token, tg_chat_id, msg)
+    except Exception as e:
+        # se falhar, tenta mandar algo menor
         try:
-            fx = api_request("GET", "/fixtures", api_key, params=params)
-        except ApiBudgetExceeded as e:
-            dbg.inc(dbg.counts, "budget_exceeded_on_daily_fixtures")
-            dbg.add_api_error(f"[BUDGET] /fixtures(date) date={d.isoformat()} err={e}")
-            break
-        debug_check_api_payload(fx, "/fixtures(date)", params, dbg)
-        for g in fx.get("response", []) or []:
-            fid = int((g.get("fixture", {}) or {}).get("id"))
-            games_map[fid] = g
-
-    games_all = list(games_map.values())
-    dbg.counts["games_all_3days_utc"] = len(games_all)
-
-    tomorrow_all: List[dict] = []
-    for g in games_all:
-        kickoff_iso = (g.get("fixture", {}) or {}).get("date")
-        if not kickoff_iso:
-            dbg.inc(dbg.filter_reasons, "missing_kickoff_iso")
-            continue
-        kickoff = dt.datetime.fromisoformat(kickoff_iso)
-        if kickoff.date().isoformat() == target_date:
-            tomorrow_all.append(g)
-    dbg.counts["tomorrow_all"] = len(tomorrow_all)
-
-    tomorrow_filtered: List[dict] = []
-    for g in tomorrow_all:
-        league = g.get("league", {}) or {}
-        country = league.get("country", "") or ""
-        league_name = league.get("name", "") or ""
-        teams = g.get("teams", {}) or {}
-        home_name = (teams.get("home", {}) or {}).get("name", "") or ""
-        away_name = (teams.get("away", {}) or {}).get("name", "") or ""
-
-        if looks_blocked_text(league_name):
-            dbg.inc(dbg.filter_reasons, "blocked_league_text"); continue
-        if looks_blocked_team(home_name) or looks_blocked_team(away_name):
-            dbg.inc(dbg.filter_reasons, "blocked_team_name"); continue
-        if not is_allowed_competition(country, league_name):
-            dbg.inc(dbg.filter_reasons, "not_allowed_competition"); continue
-        tomorrow_filtered.append(g)
-    dbg.counts["tomorrow_filtered"] = len(tomorrow_filtered)
-
-    candidates: List[dict] = []
-    kept_matches = 0
-    for g in tomorrow_filtered:
-        teams = g.get("teams", {}) or {}
-        home_id = to_int((teams.get("home", {}) or {}).get("id"))
-        away_id = to_int((teams.get("away", {}) or {}).get("id"))
-        if home_id is None or away_id is None:
-            dbg.inc(dbg.filter_reasons, "missing_team_id"); continue
-
-        home_hist = build_team_history(api_key, int(home_id), "home", dbg)
-        away_hist = build_team_history(api_key, int(away_id), "away", dbg)
-
-        if not home_hist.has_min_games() and not away_hist.has_min_games():
-            dbg.inc(dbg.filter_reasons, "both_hist_lt_min10"); continue
-
-        kept_matches += 1
-        candidates.extend(build_candidates_for_match(g, home_hist, away_hist, dbg))
-
-    dbg.counts["matches_kept_after_hist_rule"] = kept_matches
-    candidates.sort(key=lambda x: (-x["odd_book"], -x["p"], -x.get("sample_n", 0)))
-    dbg.counts["candidates_final"] = len(candidates)
-
-    combos_plan = [(2.0, 2), (3.0, 3), (4.0, 4), (5.0, 4)]
-    used_leg_ids: set[str] = set()
-    combos: List[Tuple[float, List[dict], float]] = []
-    for target, min_legs in combos_plan:
-        legs, prod = build_combo_high_odds(target, candidates, used_leg_ids, min_legs)
-        combos.append((target, legs, prod))
+            send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar mensagem principal: {repr(e)}")
+        except Exception:
+            pass
 
     dbg.api_calls_used = API_CALLS
     dbg.stats_calls_used = STATS_CALLS
 
-    msg = format_telegram_message(target_date, combos)
-    debug_txt = build_debug_report(dbg, combos, candidates)
+    # Debug opcional
+    send_debug = (os.getenv("SEND_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}
+    if not send_debug:
+        return
 
-    # sempre tenta enviar os dois
-    try:
-        send_telegram_message(tg_token, tg_chat_id, msg)
-    except Exception as e:
-        debug_txt += "\n\n[ERRO] Falha ao enviar mensagem: " + repr(e)
+    debug_txt = build_debug_report(dbg)
 
     try:
         send_telegram_document(tg_token, tg_chat_id, f"debug_{target_date}.txt", debug_txt, caption="📎 Debug do processamento")
@@ -1034,4 +1064,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
 
