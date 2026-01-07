@@ -269,8 +269,6 @@ def api_request(method: str, path: str, api_key: str, params: dict | None = None
  
     raise RuntimeError(f"Falha ao chamar {path} após retries.")
 
-=================================================================================================================================================================================================
-
 def _split_text_for_telegram(text: str, max_len: int) -> List[str]:
     text = text or ""
     if len(text) <= max_len:
@@ -524,7 +522,6 @@ def get_fixture_stats(api_key: str, fixture_id: int, dbg: Optional[DebugCollecto
     _fixture_stats_cache[fixture_id] = out
     return out
 
-=================================================================================================================================================================================================
 
 @dataclass
 class TeamHistory:
@@ -782,8 +779,6 @@ def weighted_mean(arr: List[int], halflife: float) -> Optional[float]:
     if sw <= 0:
         return None
     return sum(w[i] * float(arr[i]) for i in range(len(arr))) / sw
-
-=================================================================================================================================================================================================
 
 def weighted_beta_rate(arr: List[int], pred_fn, halflife: float) -> Optional[float]:
     """
