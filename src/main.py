@@ -1973,25 +1973,29 @@ def build_debug_report(dbg: DebugCollector) -> str:
 # Bloco 10
 def main() -> None:
     global API_CALL_BUDGET
+ 
     api_key = os.environ.get("APISPORTS_KEY", "").strip()
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+ 
     if not api_key or not tg_token or not tg_chat_id:
         raise SystemExit("Faltam envs: APISPORTS_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+ 
     # Budget total de chamadas (regra dura)
     API_CALL_BUDGET = min(int(API_CALL_BUDGET), 1500)
+ 
     now_sp = dt.datetime.now(TZ)
+ 
     # Padrão: HOJE (offset configurável). TARGET_DATE sobrescreve.
     default_date = (now_sp + dt.timedelta(days=DEFAULT_TARGET_DATE_OFFSET_DAYS)).date().isoformat()
     target_date = (os.getenv("TARGET_DATE") or default_date).strip()
+ 
     dbg = DebugCollector()
     dbg.run_started_sp = now_sp.isoformat()
     dbg.target_date = target_date
     dbg.api_calls_budget = API_CALL_BUDGET
-    # Busca jogos do dia (somente futuros), já filtrando por liga/time
-    day_fx = select_day_fixtures(api_key, target_date, dbg=dbg)
-    if dbg:
-        dbg.add_match_detail(f"[DAY] fixtures_after_filters={len(day_fx)} target_date={target_date}")
+    dbg.stats_calls_budget = STATS_CALL_BUDGET
+ 
     # Seed opcional para reproduzir o ranking aleatório
     import random
     seed_raw = (os.getenv("RANDOM_SEED") or "").strip()
@@ -2002,10 +2006,29 @@ def main() -> None:
             seed_val = None
     else:
         seed_val = None
+ 
     if seed_val is not None:
         random.seed(seed_val)
+ 
+    # Odds-alvo (envs) — compatíveis com versões antigas
+    target_ticket_odd = float(os.getenv("TARGET_TICKET_ODD", os.getenv("TARGET_COMBO_ODD", "3.0")))
+    target_market_odd = float(os.getenv("TARGET_MARKET_ODD", "1.25"))
+ 
     if dbg:
+        dbg.add_match_detail(f"[RUN] started_sp={dbg.run_started_sp} target_date={target_date}")
+        dbg.add_match_detail(f"[CFG] API_CALL_BUDGET={API_CALL_BUDGET} (hard<=1500)")
+        dbg.add_match_detail(f"[CFG] STATS_CALL_BUDGET={STATS_CALL_BUDGET}")
+        dbg.add_match_detail(f"[CFG] HIST_MAX_GAMES={HIST_MAX_GAMES} HIST_MIN_GAMES={HIST_MIN_GAMES}")
+        dbg.add_match_detail(f"[CFG] EWMA_HALFLIFE_GAMES={EWMA_HALFLIFE_GAMES}")
+        dbg.add_match_detail(f"[CFG] TARGET_TICKET_ODD={target_ticket_odd} TARGET_MARKET_ODD={target_market_odd}")
         dbg.add_match_detail(f"[RANK] random_seed={'none' if seed_val is None else seed_val}")
+ 
+    # Busca jogos do dia (somente futuros), já filtrando por liga/time
+    day_fx = select_day_fixtures(api_key, target_date, dbg=dbg)
+ 
+    if dbg:
+        dbg.add_match_detail(f"[DAY] fixtures_after_filters={len(day_fx)}")
+ 
     # Monta bilhetes progressivamente (até 10), respeitando:
     # - ranking aleatório
     # - regra dura de 10 amostras em cada um dos 5 mercados (já validada no build_match_candidates)
@@ -2014,11 +2037,15 @@ def main() -> None:
         api_key=api_key,
         day_fixtures=day_fx,
         n_target=10,
-        target_ticket_odd=float(os.getenv("TARGET_TICKET_ODD", os.getenv("TARGET_COMBO_ODD", "3.0"))),
-        target_market_odd=float(os.getenv("TARGET_MARKET_ODD", "1.25")),
+        target_ticket_odd=target_ticket_odd,
+        target_market_odd=target_market_odd,
         dbg=dbg,
     )
+ 
+    # Monta mensagem final
     msg = build_picks_message(target_date, combos)
+ 
+    # Envia mensagem principal
     send_ok = True
     try:
         send_telegram_message(tg_token, tg_chat_id, msg)
@@ -2028,33 +2055,81 @@ def main() -> None:
             send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar mensagem principal: {repr(e)}")
         except Exception:
             pass
+ 
+    # Atualiza contadores de uso
     dbg.api_calls_used = API_CALLS
-    dbg.stats_calls_used = STATS_CALLS  # mantido se você estiver coletando STATS_CALLS em outras partes
-    # Debug TXT (opcional)
-    send_debug = (os.getenv("SEND_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}
-    send_debug_on_empty = (os.getenv("SEND_DEBUG_ON_EMPTY") or "1").strip().lower() in {"1", "true", "yes", "y"}
-    send_debug_on_fail = (os.getenv("SEND_DEBUG_ON_FAIL") or "1").strip().lower() in {"1", "true", "yes", "y"}
-    should_send_debug = (
-        send_debug
-        or (send_debug_on_empty and len(combos) == 0)
-        or (send_debug_on_fail and (not send_ok))
-    )
-    if not should_send_debug:
-        return
-    debug_txt = build_debug_report(dbg)
-    debug_with_msg = debug_txt + "\n\n==== MESSAGE_SENT ====\n" + msg + "\n"
-    try:
-        send_telegram_document(
-            tg_token,
-            tg_chat_id,
-            f"debug_{target_date}.txt",
-            debug_with_msg,
-            caption="📎 Debug do processamento (decisões e legs)",
+    dbg.stats_calls_used = STATS_CALLS
+ 
+    # Enriquecimento do debug: registra bilhetes montados e pernas escolhidas (com p/odd/samples/meta)
+    if dbg:
+        dbg.add_match_detail(f"[RESULT] combos_built={len(combos)} send_ok={send_ok}")
+        for i, (legs, prod) in enumerate(combos, start=1):
+            if not legs:
+                continue
+            first = legs[0]
+            fid = int(first.get("fixture_id") or 0)
+            h = str(first.get("home") or "")
+            a = str(first.get("away") or "")
+            league = str(first.get("league") or "")
+            kickoff = int(first.get("kickoff_ts") or 0)
+ 
+            dbg.add_match_detail(
+                f"[TICKET] {i} fid={fid} {h} x {a} kickoff={_fmt_hhmm_from_ts(kickoff)} league={league} "
+                f"ticket_odd≈{float(prod):.3f}"
+            )
+ 
+            # Ordena para ficar consistente no debug (5 mercados)
+            order = {"dupla_chance": 0, "gols": 1, "escanteios": 2, "cartoes": 3, "sog": 4}
+            legs_sorted = sorted(legs, key=lambda x: order.get(str(x.get("type") or ""), 99))
+ 
+            for l in legs_sorted:
+                t = str(l.get("type") or "")
+                label = str(l.get("label") or "")
+                odd = float(l.get("odd_theoretical", 0.0))
+                p = float(l.get("p", 0.0))
+                samples = int(l.get("samples", 0))
+                meta = l.get("meta") or {}
+ 
+                # meta resumido (sem perder campos)
+                metric = meta.get("metric")
+                op = meta.get("op")
+                K = meta.get("K")
+                res_allowed = meta.get("result_allowed")
+ 
+                dbg.add_match_detail(
+                    f"  - leg type={t} odd≈{odd:.3f} p≈{p:.4f} samples={samples} "
+                    f"label='{label}' meta(metric={metric}, op={op}, K={K}, result_allowed={res_allowed})"
+                )
+ 
+    # Sempre construir e enviar TXT de debug (pode desativar por env se quiser)
+    send_debug_doc = (os.getenv("SEND_DEBUG_DOC") or "1").strip().lower() in {"1", "true", "yes", "y"}
+ 
+    if send_debug_doc:
+        debug_txt = build_debug_report(dbg)
+ 
+        # Anexa também a mensagem final enviada (útil para auditoria)
+        debug_with_msg = (
+            debug_txt
+            + "\n\n==== MESSAGE_SENT ====\n"
+            + msg
+            + "\n"
         )
-    except Exception as e:
+ 
         try:
-            send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar debug TXT: {repr(e)}")
-        except Exception:
-            pass
+            send_telegram_document(
+                tg_token,
+                tg_chat_id,
+                f"debug_{target_date}.txt",
+                debug_with_msg,
+                caption="📎 Debug completo do processamento (início ao fim)",
+            )
+        except Exception as e:
+            # fallback: avisa que falhou o envio do arquivo
+            try:
+                send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar debug TXT: {repr(e)}")
+            except Exception:
+                pass
+ 
+ 
 if __name__ == "__main__":
     main()
