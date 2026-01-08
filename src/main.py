@@ -1973,34 +1973,25 @@ def build_debug_report(dbg: DebugCollector) -> str:
 # Bloco 10
 def main() -> None:
     global API_CALL_BUDGET
- 
     api_key = os.environ.get("APISPORTS_KEY", "").strip()
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
- 
     if not api_key or not tg_token or not tg_chat_id:
         raise SystemExit("Faltam envs: APISPORTS_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
- 
     # Budget total de chamadas (regra dura)
     API_CALL_BUDGET = min(int(API_CALL_BUDGET), 1500)
- 
     now_sp = dt.datetime.now(TZ)
- 
     # Padrão: HOJE (offset configurável). TARGET_DATE sobrescreve.
     default_date = (now_sp + dt.timedelta(days=DEFAULT_TARGET_DATE_OFFSET_DAYS)).date().isoformat()
     target_date = (os.getenv("TARGET_DATE") or default_date).strip()
- 
     dbg = DebugCollector()
     dbg.run_started_sp = now_sp.isoformat()
     dbg.target_date = target_date
     dbg.api_calls_budget = API_CALL_BUDGET
- 
     # Busca jogos do dia (somente futuros), já filtrando por liga/time
     day_fx = select_day_fixtures(api_key, target_date, dbg=dbg)
- 
     if dbg:
         dbg.add_match_detail(f"[DAY] fixtures_after_filters={len(day_fx)} target_date={target_date}")
- 
     # Seed opcional para reproduzir o ranking aleatório
     import random
     seed_raw = (os.getenv("RANDOM_SEED") or "").strip()
@@ -2011,13 +2002,10 @@ def main() -> None:
             seed_val = None
     else:
         seed_val = None
- 
     if seed_val is not None:
         random.seed(seed_val)
- 
     if dbg:
         dbg.add_match_detail(f"[RANK] random_seed={'none' if seed_val is None else seed_val}")
- 
     # Monta bilhetes progressivamente (até 10), respeitando:
     # - ranking aleatório
     # - regra dura de 10 amostras em cada um dos 5 mercados (já validada no build_match_candidates)
@@ -2026,13 +2014,11 @@ def main() -> None:
         api_key=api_key,
         day_fixtures=day_fx,
         n_target=10,
-        target_ticket_odd=TARGET_COMBO_ODD,
+        target_ticket_odd=float(os.getenv("TARGET_TICKET_ODD", os.getenv("TARGET_COMBO_ODD", "3.0"))),
         target_market_odd=float(os.getenv("TARGET_MARKET_ODD", "1.25")),
         dbg=dbg,
     )
- 
     msg = build_picks_message(target_date, combos)
- 
     send_ok = True
     try:
         send_telegram_message(tg_token, tg_chat_id, msg)
@@ -2042,15 +2028,12 @@ def main() -> None:
             send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar mensagem principal: {repr(e)}")
         except Exception:
             pass
- 
     dbg.api_calls_used = API_CALLS
     dbg.stats_calls_used = STATS_CALLS  # mantido se você estiver coletando STATS_CALLS em outras partes
- 
     # Debug TXT (opcional)
     send_debug = (os.getenv("SEND_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}
     send_debug_on_empty = (os.getenv("SEND_DEBUG_ON_EMPTY") or "1").strip().lower() in {"1", "true", "yes", "y"}
     send_debug_on_fail = (os.getenv("SEND_DEBUG_ON_FAIL") or "1").strip().lower() in {"1", "true", "yes", "y"}
- 
     should_send_debug = (
         send_debug
         or (send_debug_on_empty and len(combos) == 0)
@@ -2058,10 +2041,8 @@ def main() -> None:
     )
     if not should_send_debug:
         return
- 
     debug_txt = build_debug_report(dbg)
     debug_with_msg = debug_txt + "\n\n==== MESSAGE_SENT ====\n" + msg + "\n"
- 
     try:
         send_telegram_document(
             tg_token,
@@ -2075,10 +2056,5 @@ def main() -> None:
             send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar debug TXT: {repr(e)}")
         except Exception:
             pass
- 
- 
 if __name__ == "__main__":
     main()
-                     
-                    
-                     
