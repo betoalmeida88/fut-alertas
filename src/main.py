@@ -2047,7 +2047,7 @@ def build_target_combos(
             dbg.inc(dbg.counts, f"target_combos_generated_{len(out)}")
  
     return out
-
+#################################################################################################################################################################
 def select_day_fixtures(api_key: str, target_date: str, dbg: Optional[DebugCollector] = None) -> List[dict]:
     params = {"date": target_date, "timezone": "America/Sao_Paulo"}
     try:
@@ -2196,7 +2196,7 @@ def build_debug_report(dbg: DebugCollector) -> str:
         out.append("")
  
     if dbg.match_details:
-        out.append("-- match_details --")
+        out.append("-- match_details (ordem do ranking, decisões e legs escolhidas) --")
         out.extend(dbg.match_details)
         out.append("")
  
@@ -2240,30 +2240,79 @@ def main() -> None:
     if max_day > 0:
         day_fx = day_fx[:max_day]
  
-    # Ranking totalmente aleatório (ajuste alinhado)
+    # Ranking totalmente aleatório (ajuste alinhado) + log para debug
     import random
-    random.shuffle(day_fx)
+    seed_raw = (os.getenv("RANDOM_SEED") or "").strip()
+    if seed_raw:
+        try:
+            seed_val = int(seed_raw)
+        except Exception:
+            seed_val = None
+    else:
+        seed_val = None
+ 
+    rng = random.Random(seed_val)
+    rng.shuffle(day_fx)
+ 
+    if dbg:
+        dbg.add_match_detail(f"[RANK] total_day_fixtures_after_filters={len(day_fx)} max_day={max_day}")
+        dbg.add_match_detail(f"[RANK] random_seed={'none' if seed_val is None else seed_val}")
  
     combos: List[Tuple[List[dict], float]] = []
     used_fixture_ids: Set[int] = set()
     used_leg_ids: Set[str] = set()
  
     # Seleção incremental: percorre o ranking e vai montando até fechar N bilhetes (ou acabar)
-    for fx in day_fx:
+    for idx, fx in enumerate(day_fx, start=1):
         if len(combos) >= N_TARGET_COMBOS:
+            if dbg:
+                dbg.add_match_detail(f"[STOP] reached_target_combos={N_TARGET_COMBOS}")
             break
  
         fixture = fx.get("fixture") or {}
+        teams = fx.get("teams") or {}
+        league = fx.get("league") or {}
+ 
         fid = to_int(fixture.get("id"))
+        kickoff_ts = to_int(fixture.get("timestamp")) or 0
+ 
+        home = teams.get("home") or {}
+        away = teams.get("away") or {}
+        hname = str(home.get("name") or "")
+        aname = str(away.get("name") or "")
+        lname = str(league.get("name") or "")
+        lcountry = str(league.get("country") or "")
+ 
         if fid is None:
+            if dbg:
+                dbg.add_match_detail(f"[SKIP] idx={idx} fixture_id=None {hname} x {aname} {lname}")
             continue
+ 
         if int(fid) in used_fixture_ids:
+            if dbg:
+                dbg.add_match_detail(f"[SKIP] idx={idx} fid={int(fid)} already_used_fixture")
             continue
+ 
+        if dbg:
+            dbg.add_match_detail(
+                f"[TRY] idx={idx} fid={int(fid)} {hname} x {aname} "
+                f"kickoff={_fmt_hhmm_from_ts(kickoff_ts)} league={lname} country={lcountry}"
+            )
  
         # Constrói candidatos do jogo (aplica regra dura de amostras dentro de build_match_candidates)
         fixture_cands = build_match_candidates(api_key, fx, dbg=dbg)
         if not fixture_cands:
+            if dbg:
+                dbg.add_match_detail(f"[SKIP] idx={idx} fid={int(fid)} no_candidates_after_rules")
             continue
+ 
+        # Log: distribuição de candidatos por type
+        if dbg:
+            by_type: Dict[str, int] = {}
+            for c in fixture_cands:
+                t = str(c.get("type") or "")
+                by_type[t] = by_type.get(t, 0) + 1
+            dbg.add_match_detail(f"[CANDS] idx={idx} fid={int(fid)} by_type={by_type} total={len(fixture_cands)}")
  
         base_state = _fresh_constraint_state()
         best = _best_combo_from_single_fixture(
@@ -2275,22 +2324,40 @@ def main() -> None:
             fixture_state=base_state,
         )
         if best is None:
+            if dbg:
+                dbg.add_match_detail(f"[SKIP] idx={idx} fid={int(fid)} best_ticket=None")
             continue
  
         legs, prod = best
         if not legs:
+            if dbg:
+                dbg.add_match_detail(f"[SKIP] idx={idx} fid={int(fid)} best_ticket_empty")
             continue
+ 
+        # Log: legs escolhidas (com odds)
+        if dbg:
+            legs_str = []
+            for l in legs:
+                legs_str.append(
+                    f"{str(l.get('type') or '')}:{str(l.get('label') or '')} odd≈{float(l.get('odd_book',0.0)):.2f}"
+                )
+            dbg.add_match_detail(f"[PICK] idx={idx} fid={int(fid)} legs={legs_str} ticket_odd≈{float(prod):.3f}")
  
         combos.append((legs, prod))
         used_fixture_ids.add(int(fid))
         if ENFORCE_GLOBAL_UNIQUE_LEGS:
             used_leg_ids.update(str(l.get("leg_id") or "") for l in legs if l.get("leg_id") is not None)
  
+        if dbg:
+            dbg.add_match_detail(f"[OK] idx={idx} fid={int(fid)} combos_now={len(combos)}")
+ 
     msg = build_picks_message(target_date, combos)
  
+    send_ok = True
     try:
         send_telegram_message(tg_token, tg_chat_id, msg)
     except Exception as e:
+        send_ok = False
         try:
             send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar mensagem principal: {repr(e)}")
         except Exception:
@@ -2299,17 +2366,37 @@ def main() -> None:
     dbg.api_calls_used = API_CALLS
     dbg.stats_calls_used = STATS_CALLS
  
+    # Debug TXT: agora com mais "match_details" (ranking, motivos e legs).
+    # Pode enviar sempre, ou apenas quando habilitado por envs.
     send_debug = (os.getenv("SEND_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y"}
-    if not send_debug:
+    send_debug_on_empty = (os.getenv("SEND_DEBUG_ON_EMPTY") or "1").strip().lower() in {"1", "true", "yes", "y"}
+    send_debug_on_fail = (os.getenv("SEND_DEBUG_ON_FAIL") or "1").strip().lower() in {"1", "true", "yes", "y"}
+ 
+    should_send_debug = (
+        send_debug
+        or (send_debug_on_empty and len(combos) == 0)
+        or (send_debug_on_fail and (not send_ok))
+    )
+ 
+    if not should_send_debug:
         return
  
     debug_txt = build_debug_report(dbg)
+ 
+    # Anexa também a mensagem final enviada (útil para auditoria do output)
+    debug_with_msg = debug_txt + "\n\n==== MESSAGE_SENT ====\n" + msg + "\n"
+ 
     try:
-        send_telegram_document(tg_token, tg_chat_id, f"debug_{target_date}.txt", debug_txt, caption="📎 Debug do processamento")
+        send_telegram_document(
+            tg_token,
+            tg_chat_id,
+            f"debug_{target_date}.txt",
+            debug_with_msg,
+            caption="📎 Debug do processamento (ranking, decisões e legs)",
+        )
     except Exception as e:
         send_telegram_message(tg_token, tg_chat_id, f"Falha ao enviar debug TXT: {repr(e)}")
  
  
 if __name__ == "__main__":
     main()
-
