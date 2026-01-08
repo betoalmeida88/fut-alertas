@@ -329,16 +329,22 @@ def pick_label_type(label: str) -> str:
     Mantido apenas para categorizar os 5 mercados definidos.
     """
     l = (label or "").lower()
-    if "dupla chance" in l:
+ 
+    # aceita as duas formas: "dupla chance" e "chance dupla"
+    if ("dupla chance" in l) or ("chance dupla" in l):
         return "dupla_chance"
+ 
     if "gols" in l:
         return "gols"
     if "escante" in l:
         return "escanteios"
     if "cart" in l:
         return "cartoes"
-    if "chutes a gol" in l:
+ 
+    # robustez: aceita "chutes a gol" e "chutes ao gol"
+    if ("chutes a gol" in l) or ("chutes ao gol" in l):
         return "sog"
+ 
     return "outros"
  
  
