@@ -39,6 +39,10 @@ N_TARGET_COMBOS = int(os.getenv("N_TARGET_COMBOS", "10"))
 MIN_LEGS_TARGET = 5
 MAX_LEGS_TARGET = 5
  
+# (Opcional) Impede repetir a MESMA perna (leg_id) entre bilhetes do mesmo dia
+# Default: desligado (0) para não travar geração de bilhetes
+ENFORCE_GLOBAL_UNIQUE_LEGS = (os.getenv("ENFORCE_GLOBAL_UNIQUE_LEGS", "0").strip().lower() in {"1", "true", "yes", "y"})
+ 
 # Odd-alvo por perna (selecionar a mais próxima possível deste valor por mercado)
 TARGET_LEG_ODD = float(os.getenv("TARGET_LEG_ODD", "1.25"))
  
