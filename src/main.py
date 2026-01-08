@@ -1994,7 +1994,6 @@ def main() -> None:
     dbg.run_started_sp = now_sp.isoformat()
     dbg.target_date = target_date
     dbg.api_calls_budget = API_CALL_BUDGET
-    dbg.stats_calls_budget = STATS_CALL_BUDGET
  
     # Seed opcional para reproduzir o ranking aleatório
     import random
@@ -2017,7 +2016,6 @@ def main() -> None:
     if dbg:
         dbg.add_match_detail(f"[RUN] started_sp={dbg.run_started_sp} target_date={target_date}")
         dbg.add_match_detail(f"[CFG] API_CALL_BUDGET={API_CALL_BUDGET} (hard<=1500)")
-        dbg.add_match_detail(f"[CFG] STATS_CALL_BUDGET={STATS_CALL_BUDGET}")
         dbg.add_match_detail(f"[CFG] HIST_MAX_GAMES={HIST_MAX_GAMES} HIST_MIN_GAMES={HIST_MIN_GAMES}")
         dbg.add_match_detail(f"[CFG] EWMA_HALFLIFE_GAMES={EWMA_HALFLIFE_GAMES}")
         dbg.add_match_detail(f"[CFG] TARGET_TICKET_ODD={target_ticket_odd} TARGET_MARKET_ODD={target_market_odd}")
