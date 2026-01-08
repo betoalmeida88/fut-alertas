@@ -2056,8 +2056,8 @@ def main() -> None:
         base_state = _fresh_constraint_state()
         best = _best_ticket_from_single_fixture(
             fixture_cands=fixture_cands,
-            target_ticket_odd=float(TARGET_COMBO_ODD),   # alvo do produto do bilhete
-            target_market_odd=float(TARGET_LEG_ODD),     # odd-alvo por mercado (~1.25)
+            target_ticket_odd=float(TARGET_LEG_ODD) ** 5,  # 1.25^5 ≈ 3.05 (coerente com 5 mercados)
+            target_market_odd=float(TARGET_LEG_ODD),       # odd-alvo por mercado (~1.25)
             fixture_state=base_state,
         )
         if best is None:
