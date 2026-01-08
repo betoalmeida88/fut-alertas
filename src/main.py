@@ -2054,12 +2054,10 @@ def main() -> None:
                 by_type[t] = by_type.get(t, 0) + 1
             dbg.add_match_detail(f"[CANDS] idx={idx} fid={int(fid)} by_type={by_type} total={len(fixture_cands)}")
         base_state = _fresh_constraint_state()
-        best = _best_combo_from_single_fixture(
+        best = _best_ticket_from_single_fixture(
             fixture_cands=fixture_cands,
-            target_odd=TARGET_COMBO_ODD,
-            min_legs=MIN_LEGS_TARGET,
-            max_legs=MAX_LEGS_TARGET,
-            banned_leg_ids=used_leg_ids if ENFORCE_GLOBAL_UNIQUE_LEGS else set(),
+            target_ticket_odd=float(TARGET_COMBO_ODD),   # alvo do produto do bilhete
+            target_market_odd=float(TARGET_LEG_ODD),     # odd-alvo por mercado (~1.25)
             fixture_state=base_state,
         )
         if best is None:
