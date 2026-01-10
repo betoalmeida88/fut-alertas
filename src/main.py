@@ -89,33 +89,49 @@ COUNTRY_ALIASES = {
  
 BRAZIL_STATE_KEYWORDS = ["paulista", "carioca", "mineiro"]
  
+# # Allowlist (somente estas competições entram: jogos do dia e histórico)
+# _ALLOW_RAW: Dict[str, Set[str]] = {
+#     "england": {"premier league", "championship", "fa cup", "efl cup", "league cup"},
+#     "spain": {"la liga", "segunda division", "copa del rey", "supercopa de espana"},
+#     "germany": {"bundesliga", "2 bundesliga", "dfb pokal", "dfl supercup"},
+#     "italy": {"serie a", "serie b", "coppa italia", "supercoppa italiana"},
+#     "france": {"ligue 1", "ligue 2", "coupe de france", "trophee des champions"},
+#     "portugal": {"primeira liga", "taca de portugal", "supertaca candido de oliveira"},
+#     "netherlands": {"eredivisie", "knvb beker", "johan cruijff schaal"},
+#     "belgium": {"jupiler pro league", "belgian cup", "super cup"},
+#     "turkey": {"super lig", "turkiye kupasi", "super kupa"},
+#     "scotland": {"premiership", "scottish cup", "league cup"},
+#     "argentina": {"liga profesional argentina", "copa argentina"},
+#     "mexico": {"liga mx", "copa mx"},
+#     "brazil": {"serie a", "serie b", "copa do brasil", "supercopa do brasil", "paulista", "carioca", "mineiro"},
+#     "world": {
+#         "uefa champions league", "champions league",
+#         "uefa europa league",
+#         "uefa europa conference league",
+#         "fifa club world cup", "club world cup",
+#         "world cup",
+#         "euro championship",
+#         "copa america",
+#         "uefa nations league",
+#         "africa cup of nations", "afcon",
+#         "asian cup",
+#         "concacaf gold cup",
+#     },
+# }
+
 # Allowlist (somente estas competições entram: jogos do dia e histórico)
 _ALLOW_RAW: Dict[str, Set[str]] = {
-    "england": {"premier league", "championship", "fa cup", "efl cup", "league cup"},
-    "spain": {"la liga", "segunda division", "copa del rey", "supercopa de espana"},
-    "germany": {"bundesliga", "2 bundesliga", "dfb pokal", "dfl supercup"},
-    "italy": {"serie a", "serie b", "coppa italia", "supercoppa italiana"},
-    "france": {"ligue 1", "ligue 2", "coupe de france", "trophee des champions"},
-    "portugal": {"primeira liga", "taca de portugal", "supertaca candido de oliveira"},
-    "netherlands": {"eredivisie", "knvb beker", "johan cruijff schaal"},
-    "belgium": {"jupiler pro league", "belgian cup", "super cup"},
-    "turkey": {"super lig", "turkiye kupasi", "super kupa"},
-    "scotland": {"premiership", "scottish cup", "league cup"},
-    "argentina": {"liga profesional argentina", "copa argentina"},
-    "mexico": {"liga mx", "copa mx"},
-    "brazil": {"serie a", "serie b", "copa do brasil", "supercopa do brasil", "paulista", "carioca", "mineiro"},
+    "england": {"premier league"},
+    "spain": {"la liga"},
+    "germany": {"bundesliga"},
+    "italy": {"serie a"},
+    "france": {"ligue 1"},
+    "argentina": {"liga profesional argentina"},
+    "brazil": {"serie a"},
     "world": {
         "uefa champions league", "champions league",
         "uefa europa league",
         "uefa europa conference league",
-        "fifa club world cup", "club world cup",
-        "world cup",
-        "euro championship",
-        "copa america",
-        "uefa nations league",
-        "africa cup of nations", "afcon",
-        "asian cup",
-        "concacaf gold cup",
     },
 }
  
