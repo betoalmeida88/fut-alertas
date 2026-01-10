@@ -87,6 +87,7 @@ COUNTRY_ALIASES = {
     "international": "world",
 }
  
+BRAZIL_STATE_KEYWORDS = ["paulista"]
 # BRAZIL_STATE_KEYWORDS = ["paulista", "carioca", "mineiro"]
  
 # # Allowlist (somente estas competições entram: jogos do dia e histórico)
