@@ -87,7 +87,7 @@ COUNTRY_ALIASES = {
     "international": "world",
 }
  
-BRAZIL_STATE_KEYWORDS = ["paulista", "carioca", "mineiro"]
+# BRAZIL_STATE_KEYWORDS = ["paulista", "carioca", "mineiro"]
  
 # # Allowlist (somente estas competições entram: jogos do dia e histórico)
 # _ALLOW_RAW: Dict[str, Set[str]] = {
